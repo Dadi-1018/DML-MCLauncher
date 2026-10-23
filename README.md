@@ -166,10 +166,8 @@ WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动
 
 本项目基于 [MIT License](LICENSE) 开源。
 
-使用前请把 `LICENSE` 首行的占位符替换为实际信息：
-
 ```
-Copyright (c) <YEAR> <COPYRIGHT HOLDER>
+Copyright (c) 2026 Dadi
 ```
 
-例如 `Copyright (c) 2026 Your Name`。
+二次开发时如需替换署名，修改 `LICENSE` 首行即可。
