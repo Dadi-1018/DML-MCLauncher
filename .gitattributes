@@ -1,0 +1,17 @@
+# 统一换行符：文本文件入库用 LF，批处理脚本保持 CRLF 以便 cmd.exe 正确解析
+* text=auto
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+
+# 二进制文件不做换行符转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.lib binary
+*.pdb binary

@@ -1,0 +1,25 @@
+# ---- 构建产物 ----
+# 可执行文件与中间产物不纳入版本管理，避免把本机路径、调试信息一起发布
+build/
+*.exe
+*.pdb
+*.lib
+*.obj
+*.ilk
+*.exp
+
+# ---- 编辑器 / IDE ----
+.vs/
+.vscode/
+*.user
+*.suo
+CMakeCache.txt
+CMakeFiles/
+out/
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
+
+# ---- 本机协作文档（含本地绝对路径、机器信息）----
+.workbuddy/
