@@ -21,6 +21,8 @@
 #include <shlobj.h>
 #include <gdiplus.h>
 
+#include "resource.h"   // IDI_APPICON / IDR_LOGO
+
 #include <stdlib.h>
 #include <string>
 #include <vector>
@@ -468,7 +470,63 @@ static void DrawWindowButtons(Graphics& gr, const Layout& L) {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  品牌标志：优先使用内嵌的 dml-logo-256.png（RT_RCDATA），失败则回退手绘草方块
+// ---------------------------------------------------------------------------
+static Image*   g_logoImg    = nullptr;
+static IStream* g_logoStream = nullptr;
+
+static bool LoadLogoResource(HINSTANCE hInst) {
+    HRSRC hr = FindResourceW(hInst, MAKEINTRESOURCEW(IDR_LOGO), RT_RCDATA);
+    if (!hr) return false;
+    DWORD size = SizeofResource(hInst, hr);
+    if (size == 0) return false;
+    HGLOBAL hres = LoadResource(hInst, hr);
+    if (!hres) return false;
+    void* src = LockResource(hres);
+    if (!src) return false;
+
+    // GDI+ 需要一个持续存在的 IStream，因此把资源复制到堆内存再交给它托管
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!mem) return false;
+    void* dst = GlobalLock(mem);
+    if (!dst) { GlobalFree(mem); return false; }
+    memcpy(dst, src, size);
+    GlobalUnlock(mem);
+
+    if (CreateStreamOnHGlobal(mem, TRUE, &g_logoStream) != S_OK) {
+        GlobalFree(mem);
+        return false;
+    }
+    g_logoImg = Image::FromStream(g_logoStream, FALSE);
+    if (!g_logoImg || g_logoImg->GetLastStatus() != Ok) {
+        delete g_logoImg;
+        g_logoImg = nullptr;
+        g_logoStream->Release();
+        g_logoStream = nullptr;
+        return false;
+    }
+    return true;
+}
+
+static void FreeLogoResource() {
+    delete g_logoImg;
+    g_logoImg = nullptr;
+    if (g_logoStream) { g_logoStream->Release(); g_logoStream = nullptr; }
+}
+
 static void DrawLogo(Graphics& gr, const RectF& r) {
+    if (g_logoImg) {
+        // 标志本身已含圆角与透明边，直接高质量缩放贴入即可
+        gr.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        gr.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+        gr.DrawImage(g_logoImg, r);
+        gr.SetInterpolationMode(InterpolationModeDefault);
+        gr.SetPixelOffsetMode(PixelOffsetModeHalf);
+        return;
+    }
+
+    // ---- 回退：手绘草方块 ----
     GraphicsPath clip;
     AddRoundRect(clip, r, SR(11));
     gr.SetClip(&clip);
@@ -943,6 +1001,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     InitFonts();
     OleInitialize(nullptr);
 
+    // ---- 品牌资源（图标 + 页眉标志）----
+    if (!LoadLogoResource(hInst))
+        OutputDebugStringW(L"[DML] 内嵌标志加载失败，回退手绘草方块\n");
+
     // ---- 配置 & 环境 ----
     std::wstring savedVer;
     LoadConfig(savedVer);
@@ -960,6 +1022,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     g_app.javaPath = DetectJava();
 
     // ---- 建窗 ----
+    // 图标取自内嵌的 dml.ico（多尺寸），按系统要求的大/小图标尺寸各取一张
+    HICON hIconBig = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
+                                       LR_DEFAULTCOLOR);
+    HICON hIconSm  = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+                                       LR_DEFAULTCOLOR);
+    if (!hIconBig) hIconBig = LoadIconW(nullptr, IDI_APPLICATION);
+    if (!hIconSm)  hIconSm  = hIconBig;
+
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);
     wc.style         = CS_HREDRAW | CS_VREDRAW;
@@ -968,8 +1040,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;
     wc.lpszClassName = L"DreamMinecraftLauncherWnd";
-    wc.hIcon         = LoadIconW(nullptr, IDI_APPLICATION);
-    wc.hIconSm       = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon         = hIconBig;
+    wc.hIconSm       = hIconSm;
     RegisterClassExW(&wc);
 
     int w = S(WIN_W), h = S(WIN_H);
@@ -981,6 +1053,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
                                 WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX,
                                 x, y, w, h, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;
+
+    // 显式设置窗口图标，确保任务栏与 Alt+Tab 也用的是品牌图标
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG,   (LPARAM)hIconBig);
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIconSm);
 
     HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, S(18), S(18));
     SetWindowRgn(hwnd, rgn, TRUE);
@@ -1008,6 +1084,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     }
 
     FreeFonts();
+    FreeLogoResource();
+    if (hIconBig && hIconBig != hIconSm) DestroyIcon(hIconBig);
+    if (hIconSm) DestroyIcon(hIconSm);
     GdiplusShutdown(gpToken);
     OleUninitialize();
     return 0;

@@ -59,14 +59,22 @@
 如需换配色，只改 `generate.py` 顶部的 `GREEN` / `GREEN_LO` / `BG_A` / `BG_B` 四个常量，
 再执行 `python assets/logo/generate.py`。
 
+**图标已编入 exe**：`res/app.rc` 把 `dml.ico` 注册为 `RT_GROUP_ICON`（ID 101）、把
+`dml-logo-256.png` 原样嵌为 `RT_RCDATA`（ID 201），两者 ID 定义在 `src/resource.h`。
+运行时 `LoadImageW` 取窗口/任务栏图标，`LoadLogoResource()` 经 `CreateStreamOnHGlobal`
+把 PNG 交给 GDI+ 解码并画到页眉；资源缺失时自动回退到旧的「手绘草方块」。
+
 ## 目录结构
 
 ```
 MCLaucher/
-├─ src/main.cpp        # 全部源码（约 900 行，单文件）
+├─ src/main.cpp        # 全部源码（约 1050 行，单文件）
+├─ src/resource.h      # 资源 ID（app.rc 与 main.cpp 共用）
+├─ res/app.rc          # 资源脚本：图标 + 页眉标志
+├─ assets/logo/        # 标志源文件与生成脚本
 ├─ build.bat           # 一键编译：自动挑选 MSVC / MinGW / Zig
 ├─ CMakeLists.txt      # 可选，CMake 构建
-├─ build/DML.exe    # 编译产物
+├─ build/DML.exe       # 编译产物
 ├─ docs/               # 界面截图
 └─ README.md
 ```
@@ -80,6 +88,8 @@ build.bat
 ```
 
 脚本会依次尝试 **MSVC（VS2019/2022 含 C++ 工作负载）→ MinGW g++ → Zig**，产物在 `build\DML.exe`。
+前两者会先用 `rc.exe` / `windres` 编译 `res\app.rc`，把图标与页眉标志一并链接进 exe；
+Zig 没有资源编译器，走这条路时产物不带图标（功能不受影响，会自动回退手绘标志）。
 
 发布用的构建默认带 `-s`（剥离符号），避免可执行文件里嵌入本机绝对路径与调试信息；
 `build\` 目录已加入 `.gitignore`，调试符号（`.pdb`）不要随发行包一起分发。
@@ -87,18 +97,26 @@ build.bat
 若三者都不在 PATH 中，脚本还会尝试本机已缓存的 zig 工具链（具体路径见 `build.bat` 第 3 步），
 无需额外安装 Visual Studio 或 Windows SDK。
 
+> 踩坑记录：`windres` 内部调用 `gcc` 时不加引号，MinGW 装在含空格的路径（如
+> `C:\Program Files\...`）下会直接报 `preprocessing failed`。`build.bat` 里会在
+> `build\tc` 建一个目录联接（`mklink /J`）指向工具链根目录，用无空格路径调用；另外
+> `cc1.exe` 依赖 `libwinpthread-1.dll`，必须把 `<mingw>\bin` 加进 `PATH`，否则报的是
+> 无任何提示的 `exit 1`（实际退出码 `0xC0000135` = STATUS_DLL_NOT_FOUND）。
+
 ### 方式二：MSVC（开发者命令提示符）
 
 ```bat
-cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE src\main.cpp ^
+rc /nologo /fo build\app.res res\app.rc
+cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE src\main.cpp build\app.res ^
    /Fe:build\DML.exe /link /SUBSYSTEM:WINDOWS gdiplus.lib shell32.lib ole32.lib
 ```
 
 ### 方式三：MinGW-w64
 
 ```bat
-g++ -std=c++17 -O2 -mwindows -DUNICODE -D_UNICODE src\main.cpp -o build\DML.exe ^
-    -lgdiplus -lshell32 -lole32 -lgdi32 -luser32 -static-libgcc -static-libstdc++
+windres res\app.rc -O coff -o build\app.res.o
+g++ -std=c++17 -O2 -mwindows -DUNICODE -D_UNICODE src\main.cpp build\app.res.o ^
+    -o build\DML.exe -lgdiplus -lshell32 -lole32 -lgdi32 -luser32 -static -s
 ```
 
 ### 方式四：CMake
@@ -114,6 +132,7 @@ cmake --build out --config Release
 |---|---|
 | 无边框窗口 | `WS_POPUP` + `CreateRoundRectRgn` 圆角；顶部空白区拖动，自绘最小化/关闭按钮 |
 | 双缓冲绘制 | 内存 DC + `BitBlt`，`Graphics` 抗锯齿，窗口缩放/重绘不闪烁 |
+| 品牌资源 | 图标与页眉标志编进 exe（`res/app.rc`）；窗口、任务栏图标取自多尺寸 `dml.ico`，页眉用 GDI+ 高质量缩放绘制 PNG 标志 |
 | 自绘输入框 | 光标闪烁（`WM_CHAR` / 定时器）、退格、16 字符上限、聚焦高亮描边 |
 | 自绘下拉框 | 浮层绘制在主窗口之上、悬停高亮、滚轮翻页（>6 个版本时） |
 | 内存滑块 | 1–16 GB 拖动调节，按下即跟随鼠标并捕获输入 |
@@ -136,6 +155,8 @@ Theme           配色常量
 S() / SR()      DPI 缩放换算
 AddRoundRect    圆角矩形路径（FillRound / StrokeRound）
 DrawStr         带对齐与省略号的文字绘制
+DrawLogo        页眉标志（内嵌 PNG 优先，缺失时回退手绘草方块）
+LoadLogoResource  从 RT_RCDATA 取出 PNG → IStream → GDI+ Image
 ComputeLayout   全部控件坐标集中在此，改界面只改这一个函数
 AppState        全局状态（昵称、版本、内存、hover、下拉、启动进度）
 ScanVersions    扫描 .minecraft\versions
