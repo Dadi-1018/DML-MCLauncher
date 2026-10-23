@@ -1,9 +1,9 @@
 // ============================================================================
-//  MCLite —— 极简 Minecraft 启动器示例（C++ / Win32 / GDI+）
+//  Dream Minecraft Launcher (DML) —— 极简 Minecraft 启动器示例
 //  ---------------------------------------------------------------------------
 //  · 纯 Win32 API + GDI+ 手绘界面，无任何第三方 UI 库，单文件实现
 //  · 无边框圆角窗口、自绘输入框 / 下拉框 / 滑块 / 按钮 / 日志面板
-//  · 配置持久化（%APPDATA%\MCLite\config.ini）
+//  · 配置持久化（%APPDATA%\DreamMinecraftLauncher\config.ini）
 //  · 自动探测 .minecraft 目录、已安装版本、Java 运行时
 //  · 启动流程为「示例实现」：构建真实命令行并模拟进度，不真正拉起游戏
 //    （真实启动的接入点见 BuildLaunchCommand() 上方的注释）
@@ -259,7 +259,7 @@ static std::wstring ExeDir() {
 static std::wstring AppDataConfigDir() {
     wchar_t buf[MAX_PATH] = {0};
     if (!GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH)) return ExeDir();
-    return std::wstring(buf) + L"\\MCLite";
+    return std::wstring(buf) + L"\\DreamMinecraftLauncher";
 }
 
 static std::wstring ConfigPath() { return AppDataConfigDir() + L"\\config.ini"; }
@@ -517,8 +517,9 @@ static void Paint(HWND hwnd) {
 
         // ---------------- 头部 ----------------
         DrawLogo(gr, L.logo);
-        DrawStr(gr, L"MC Launcher", RectF(S(80), S(14), S(420), S(28)), *F.title, C(Theme::Text));
-        DrawStr(gr, L"Minecraft 示例启动器 · C++ / Win32 / GDI+",
+        DrawStr(gr, L"Dream Minecraft Launcher", RectF(S(80), S(14), S(460), S(28)),
+                *F.title, C(Theme::Text));
+        DrawStr(gr, L"DML · 示例启动器 · C++ / Win32 / GDI+",
                 RectF(S(81), S(44), S(460), S(18)), *F.sub, C(Theme::Muted));
         DrawWindowButtons(gr, L);
 
@@ -966,7 +967,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.hInstance     = hInst;
     wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;
-    wc.lpszClassName = L"MCLiteWindow";
+    wc.lpszClassName = L"DreamMinecraftLauncherWnd";
     wc.hIcon         = LoadIconW(nullptr, IDI_APPLICATION);
     wc.hIconSm       = LoadIconW(nullptr, IDI_APPLICATION);
     RegisterClassExW(&wc);
@@ -975,7 +976,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
     int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
 
-    HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"MCLiteWindow", L"MC Launcher",
+    HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"DreamMinecraftLauncherWnd",
+                                L"Dream Minecraft Launcher",
                                 WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX,
                                 x, y, w, h, nullptr, nullptr, hInst, nullptr);
     if (!hwnd) return 1;

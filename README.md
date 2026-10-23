@@ -1,4 +1,4 @@
-# MCLite —— 极简 Minecraft 启动器示例（C++）
+# Dream Minecraft Launcher (DML) —— 极简 Minecraft 启动器示例（C++）
 
 <p align="center">
   <img src="assets/logo/dml-lockup.png" alt="Dream Minecraft Launcher" width="520">
@@ -10,8 +10,8 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ ▉ MC Launcher                                    ─    ✕      │
-│   Minecraft 示例启动器 · C++ / Win32 / GDI+                  │
+│ ▉ Dream Minecraft Launcher                       ─    ✕      │
+│   DML · 示例启动器 · C++ / Win32 / GDI+                      │
 │ ┌──────────────────────────────────────────────────────────┐ │
 │ │ 玩家昵称              游戏版本                            │ │
 │ │ ┌──────────────┐     ┌────────────────────┐              │ │
@@ -66,7 +66,7 @@ MCLaucher/
 ├─ src/main.cpp        # 全部源码（约 900 行，单文件）
 ├─ build.bat           # 一键编译：自动挑选 MSVC / MinGW / Zig
 ├─ CMakeLists.txt      # 可选，CMake 构建
-├─ build/MCLite.exe    # 编译产物
+├─ build/DML.exe    # 编译产物
 ├─ docs/               # 界面截图
 └─ README.md
 ```
@@ -79,7 +79,7 @@ MCLaucher/
 build.bat
 ```
 
-脚本会依次尝试 **MSVC（VS2019/2022 含 C++ 工作负载）→ MinGW g++ → Zig**，产物在 `build\MCLite.exe`。
+脚本会依次尝试 **MSVC（VS2019/2022 含 C++ 工作负载）→ MinGW g++ → Zig**，产物在 `build\DML.exe`。
 
 发布用的构建默认带 `-s`（剥离符号），避免可执行文件里嵌入本机绝对路径与调试信息；
 `build\` 目录已加入 `.gitignore`，调试符号（`.pdb`）不要随发行包一起分发。
@@ -91,13 +91,13 @@ build.bat
 
 ```bat
 cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE src\main.cpp ^
-   /Fe:build\MCLite.exe /link /SUBSYSTEM:WINDOWS gdiplus.lib shell32.lib ole32.lib
+   /Fe:build\DML.exe /link /SUBSYSTEM:WINDOWS gdiplus.lib shell32.lib ole32.lib
 ```
 
 ### 方式三：MinGW-w64
 
 ```bat
-g++ -std=c++17 -O2 -mwindows -DUNICODE -D_UNICODE src\main.cpp -o build\MCLite.exe ^
+g++ -std=c++17 -O2 -mwindows -DUNICODE -D_UNICODE src\main.cpp -o build\DML.exe ^
     -lgdiplus -lshell32 -lole32 -lgdi32 -luser32 -static-libgcc -static-libstdc++
 ```
 
@@ -119,7 +119,7 @@ cmake --build out --config Release
 | 内存滑块 | 1–16 GB 拖动调节，按下即跟随鼠标并捕获输入 |
 | 环境探测 | 扫描 `.minecraft\versions\*\*.json` 得到真实版本列表；`JAVA_HOME` 与常见安装目录探测 Java |
 | 目录选择 | `SHBrowseForFolder` 选择游戏目录，切换后自动重扫版本 |
-| 配置持久化 | 退出/修改时写入 `%APPDATA%\MCLite\config.ini`（UTF-8） |
+| 配置持久化 | 退出/修改时写入 `%APPDATA%\DreamMinecraftLauncher\config.ini`（UTF-8） |
 | 启动流程 | 5 步进度模拟（0→100%），按钮内进度条动画，完成后输出真实命令行到日志 |
 | DPI 适配 | `SetProcessDPIAware` + 全局缩放系数，1080P / 4K 下布局一致 |
 
