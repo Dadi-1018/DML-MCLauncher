@@ -4,9 +4,13 @@
   <img src="assets/logo/dml-lockup.png" alt="Dream Minecraft Launcher" width="520">
 </p>
 
-一个**纯 C++ / Win32 / GDI+** 编写的 Minecraft 启动器样本程序：无第三方 UI 库、无运行时依赖，
+一个**纯 C++ / Win32 / GDI+** 编写的 Minecraft 启动器：无第三方 UI 库、无运行时依赖，
 编译产物只有一个 exe。界面为深色、无边框圆角窗口，所有控件（输入框、下拉框、滑块、按钮、
-日志面板）均为手工绘制，可直接作为二次开发的骨架。
+日志面板）均为手工绘制。
+
+它**能真的把游戏启动起来**：自己解析 `version.json`（含 `inheritsFrom` 继承与 `rules` 过滤）、
+拼出完整 `java` 命令行、拉起进程并把游戏输出回灌到界面日志。当前为离线模式，
+不接账号鉴权、不自动下载资源（详见[真实启动](#真实启动)与[已知限制](#已知限制)）。
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -139,7 +143,11 @@ cmake --build out --config Release
 | 环境探测 | 扫描 `.minecraft\versions\*\*.json` 得到真实版本列表；`JAVA_HOME` 与常见安装目录探测 Java |
 | 目录选择 | `SHBrowseForFolder` 选择游戏目录，切换后自动重扫版本 |
 | 配置持久化 | 退出/修改时写入 `%APPDATA%\DreamMinecraftLauncher\config.ini`（UTF-8） |
-| 启动流程 | 5 步进度模拟（0→100%），按钮内进度条动画，完成后输出真实命令行到日志 |
+| 启动流程 | 5 个真实步骤（校验账户 → 读版本清单 → 查依赖 → 整理参数 → 拉起 Java），按钮内进度条动画 |
+| 版本清单解析 | 自带极简 JSON 解析器；支持 `inheritsFrom` 继承链合并、`rules` 的 `os.name` / `os.arch` / `features` 过滤 |
+| 类路径与 natives | 按 maven 坐标还原 jar 路径，同 `group:artifact` 去重（子版本覆盖父版本）；natives jar 一并加入 `classpath`（LWJGL3 会自行从 jar 内解压原生库） |
+| 占位符替换 | `${auth_player_name}` `${version_name}` `${game_directory}` `${assets_index_name}` `${classpath}` 等全套替换，未知占位符清空 |
+| 进程拉起 | `CreateProcessW` 启动 `java`，stdout/stderr 通过管道回灌到日志面板（UTF-8 / GBK 自动判别），并检测进程退出码 |
 | DPI 适配 | `SetProcessDPIAware` + 全局缩放系数，1080P / 4K 下布局一致 |
 
 ## 快捷键
@@ -161,27 +169,52 @@ ComputeLayout   全部控件坐标集中在此，改界面只改这一个函数
 AppState        全局状态（昵称、版本、内存、hover、下拉、启动进度）
 ScanVersions    扫描 .minecraft\versions
 DetectJava      探测 java.exe
-BuildLaunchCommand  拼装完整启动命令行
+--- 版本清单与启动 ---
+JVal / JsonParser   极简 JSON 解析器（够 version.json 用）
+RulesAllow      按 os / features 过滤 libraries 与启动参数
+MavenRel        group:artifact:version[:classifier] → 相对 jar 路径
+ResolveVersion  解析继承链、合并 libraries、替换占位符、拼出完整命令行
+OfflineUuid     由昵称派生稳定 UUID
+SpawnGame       CreateProcessW 拉起 java，管道回灌输出
+PipeReader      子进程 stdout/stderr → WM_APP_LOG（UTF-8/GBK 自动判别）
+RunLaunchStep   启动流程的单步真实动作（由 WM_TIMER 驱动）
 Paint           绘制入口（先背景 → 卡片 → 控件 → 浮层）
-WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动
+WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动 / 启动进度
 ```
 
-## 接入真实启动
+## 真实启动
 
-当前 `StartLaunch()` 只做进度模拟，不会真正拉起游戏。真实启动需要补齐：
+点击「启动游戏」后会真的把游戏拉起来，不再只是进度动画。流程分 5 步，每步都做实事：
 
-1. **鉴权**：微软 OAuth 设备码流程，或离线登录（`--uuid` / `--accessToken` 用占位值）。
-2. **版本清单**：解析 `versions\<v>\<v>.json` 的 `inheritsFrom` 继承链，合并 libraries。
-3. **补全资源**：下载缺失的 `libraries`、校验 `assets` 索引、解压 `natives`。可用 [libcurl] 或 WinHTTP。
-4. **启动进程**：把 `BuildLaunchCommand()` 的结果交给 `CreateProcessW`（源码中已给出示例片段）。
+| 步骤 | 实际动作 |
+|---|---|
+| 校验账户信息 | 检查 Java 是否可用，生成离线 UUID |
+| 读取版本清单 | 解析 `versions\<v>\<v>.json`，沿 `inheritsFrom` 合并继承链 |
+| 检查依赖文件 | 逐个校验 `libraries` / 客户端 jar 是否存在，缺失就中止并列出首个缺失路径 |
+| 整理类路径与参数 | 拼 `-cp`、替换全部占位符，逐参数转义 |
+| 启动 Java 进程 | `CreateProcessW` 拉起，管道读回 stdout/stderr 显示在日志区 |
+
+成功拉起后，最终命令行会写到 `%APPDATA%\DreamMinecraftLauncher\last-command.txt`，方便排查启动失败。
+
+**当前是离线模式**，因此这些还没做（见下方「已知限制」）：
+
+1. **鉴权**：没有接微软 OAuth 设备码流程，`--accessToken` / `--uuid` 用离线占位值，
+   进不了正版服务器。
+2. **资源补全**：不下载缺失的 `libraries` / `assets`，如果版本没装全，
+   启动会直接报「缺少 N 个依赖文件」，请先用官方启动器把该版本装好。
+3. **natives 解压**：不自己解压 natives jar，而是把 natives jar 加进 `classpath`，
+   由 LWJGL3 在加载时自行从 jar 内提取原生库。这套做法对 1.13+ 有效；
+   更老的 LWJGL2 版本仍需真实解压到 `versions\<v>\natives`。
 
 建议把上述逻辑拆成独立的 `Launcher` 类，保持 UI 层只负责展示与交互。
 
 ## 已知限制
 
-- 启动流程为演示实现，不下载资源、不登录。
+- 启动为**离线模式**：不登录、不下载资源、不校验 assets 完整性。
+- 版本没装全时不会自动补齐，只会提示缺多少个依赖文件（首个路径会显示在日志里）。
 - 无边框窗口不支持拖拽缩放（启动器一般也不需要）。
-- 版本列表只认 `versions\*\*.json` 存在的目录，未安装任何版本时回退到内置示例列表。
+- 版本列表只认 `versions\*\*.json` 存在的目录，未安装任何版本时回退到内置示例列表
+  （此时点启动会报「缺少依赖文件」，属于预期行为）。
 
 ## 许可证
 

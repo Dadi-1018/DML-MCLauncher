@@ -5,8 +5,10 @@
 //  · 无边框圆角窗口、自绘输入框 / 下拉框 / 滑块 / 按钮 / 日志面板
 //  · 配置持久化（%APPDATA%\DreamMinecraftLauncher\config.ini）
 //  · 自动探测 .minecraft 目录、已安装版本、Java 运行时
-//  · 启动流程为「示例实现」：构建真实命令行并模拟进度，不真正拉起游戏
-//    （真实启动的接入点见 BuildLaunchCommand() 上方的注释）
+//  · 真实启动：解析 version.json（含 inheritsFrom 继承与 rules 过滤）→ 归类
+//    libraries / natives → 替换启动占位符 → CreateProcessW 拉起 Java，
+//    子进程 stdout/stderr 实时回灌到日志面板
+//  · 离线模式启动（不做微软账号鉴权，也不自动下载缺失的 libraries/assets）
 //
 //  编译方式见 README.md
 // ============================================================================
@@ -24,14 +26,19 @@
 #include "resource.h"   // IDI_APPICON / IDR_LOGO
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string>
 #include <vector>
 #include <fstream>
 #include <algorithm>
 #include <functional>
+#include <utility>
 #include <cmath>
 
 using namespace Gdiplus;
+
+// 子进程输出回灌：LPARAM 是 new 出来的 std::wstring*，处理完需 delete
+#define WM_APP_LOG (WM_APP + 1)
 
 #ifdef _MSC_VER
 #pragma comment(lib, "gdiplus.lib")
@@ -86,6 +93,19 @@ static std::wstring U82W(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
     std::wstring w((size_t)n, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+// 子进程输出解码：Java 的 stdout/stderr 用平台默认字符集（中文系统是 GBK），
+// 所以先按 UTF-8 严格试解，失败再退回 OEM 代码页。
+static std::wstring DecodeChild(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int)s.size(), nullptr, 0);
+    UINT cp = (n > 0) ? CP_UTF8 : CP_OEMCP;
+    if (n <= 0) n = MultiByteToWideChar(cp, 0, s.data(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return U82W(s);   // 兜底：至少保留可显示的部分
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(cp, 0, s.data(), (int)s.size(), &w[0], n);
     return w;
 }
 
@@ -243,6 +263,7 @@ struct AppState {
     float progress  = 0.0f;
     int   step      = 0;
     int   resetTick = 0;
+    bool  stepRan[5] = { false, false, false, false, false };  // 该步的真实工作是否已执行
 };
 
 static AppState g_app;
@@ -379,47 +400,671 @@ static void PushLog(const std::wstring& s) {
 }
 
 // ============================================================================
-//  启动流程（示例）
-//  ---------------------------------------------------------------------------
-//  ★ 真实启动接入点：
-//    把 BuildLaunchCommand() 的命令行交给 CreateProcessW 即可拉起 Java。
-//    还需自行补齐：登录鉴权、version.json 继承解析、library 下载、
-//    natives 解压、assets 索引校验。示例只做命令行拼装 + 进度模拟，
-//    以免庞大的下载逻辑干扰 UI 演示。
-//
-//      STARTUPINFOW si{ sizeof(si) };
-//      PROCESS_INFORMATION pi{};
-//      CreateProcessW(g_app.javaPath.c_str(), cmdBuf, nullptr, nullptr, FALSE,
-//                     CREATE_NO_WINDOW, nullptr, g_app.gameDir.c_str(), &si, &pi);
+//  极简 JSON 解析（只覆盖 version.json 用到的子集）
 // ============================================================================
-static std::wstring BuildLaunchCommand() {
-    std::wstring ver  = g_app.versions.empty() ? L"1.20.4" : g_app.versions[(size_t)g_app.versionIdx];
-    std::wstring java = g_app.javaPath.empty() ? L"javaw.exe" : g_app.javaPath;
-    std::wstring dir  = g_app.gameDir.empty() ? DefaultMinecraftDir() : g_app.gameDir;
+struct JVal {
+    enum Type { NUL, BOOL, NUM, STR, ARR, OBJ };
+    Type t = NUL;
+    bool b = false;
+    double num = 0.0;
+    std::wstring s;
+    std::vector<JVal> a;
+    std::vector<std::pair<std::wstring, JVal>> o;
+
+    const JVal* get(const wchar_t* k) const {
+        if (t != OBJ) return nullptr;
+        for (size_t i = 0; i < o.size(); ++i)
+            if (o[i].first == k) return &o[i].second;
+        return nullptr;
+    }
+    std::wstring str(const wchar_t* k, const wchar_t* def = L"") const {
+        const JVal* v = get(k);
+        return (v && v->t == STR) ? v->s : std::wstring(def);
+    }
+    bool flag(const wchar_t* k, bool def = false) const {
+        const JVal* v = get(k);
+        return (v && v->t == BOOL) ? v->b : def;
+    }
+};
+
+struct JsonParser {
+    const std::wstring& src;
+    size_t i = 0;
+
+    explicit JsonParser(const std::wstring& s) : src(s) {}
+
+    void ws() {
+        while (i < src.size()) {
+            wchar_t c = src[i];
+            if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' || c == 0xFEFF) ++i;
+            else break;
+        }
+    }
+    bool eat(wchar_t c) { ws(); if (i < src.size() && src[i] == c) { ++i; return true; } return false; }
+
+    bool parseString(std::wstring& out) {
+        ws();
+        if (i >= src.size() || src[i] != L'"') return false;
+        ++i;
+        out.clear();
+        while (i < src.size()) {
+            wchar_t c = src[i++];
+            if (c == L'"') return true;
+            if (c != L'\\') { out.push_back(c); continue; }
+            if (i >= src.size()) return false;
+            wchar_t e = src[i++];
+            switch (e) {
+            case L'"':  out.push_back(L'"');  break;
+            case L'\\': out.push_back(L'\\'); break;
+            case L'/':  out.push_back(L'/');  break;
+            case L'b':  out.push_back(L'\b'); break;
+            case L'f':  out.push_back(L'\f'); break;
+            case L'n':  out.push_back(L'\n'); break;
+            case L'r':  out.push_back(L'\r'); break;
+            case L't':  out.push_back(L'\t'); break;
+            case L'u': {
+                if (i + 4 > src.size()) return false;
+                unsigned v = 0;
+                for (int k = 0; k < 4; ++k) {
+                    wchar_t h = src[i++];
+                    unsigned d;
+                    if (h >= L'0' && h <= L'9') d = (unsigned)(h - L'0');
+                    else if (h >= L'a' && h <= L'f') d = (unsigned)(h - L'a' + 10);
+                    else if (h >= L'A' && h <= L'F') d = (unsigned)(h - L'A' + 10);
+                    else return false;
+                    v = v * 16 + d;
+                }
+                out.push_back((wchar_t)v);   // wchar_t 在 Windows 上是 UTF-16 单元，代理对分两次写入
+                break;
+            }
+            default: return false;
+            }
+        }
+        return false;
+    }
+
+    bool parseValue(JVal& v) {
+        ws();
+        if (i >= src.size()) return false;
+        wchar_t c = src[i];
+        if (c == L'{') {
+            v.t = JVal::OBJ;
+            ++i;
+            if (eat(L'}')) return true;
+            do {
+                std::wstring key;
+                if (!parseString(key)) return false;
+                if (!eat(L':')) return false;
+                JVal child;
+                if (!parseValue(child)) return false;
+                v.o.push_back(std::make_pair(key, child));
+            } while (eat(L','));
+            return eat(L'}');
+        }
+        if (c == L'[') {
+            v.t = JVal::ARR;
+            ++i;
+            if (eat(L']')) return true;
+            do {
+                JVal child;
+                if (!parseValue(child)) return false;
+                v.a.push_back(child);
+            } while (eat(L','));
+            return eat(L']');
+        }
+        if (c == L'"') { v.t = JVal::STR; return parseString(v.s); }
+        if (src.compare(i, 4, L"true") == 0)  { i += 4; v.t = JVal::BOOL; v.b = true;  return true; }
+        if (src.compare(i, 5, L"false") == 0) { i += 5; v.t = JVal::BOOL; v.b = false; return true; }
+        if (src.compare(i, 4, L"null") == 0)  { i += 4; v.t = JVal::NUL;  return true; }
+
+        // number
+        size_t start = i;
+        if (i < src.size() && (src[i] == L'-' || src[i] == L'+')) ++i;
+        while (i < src.size() && ((src[i] >= L'0' && src[i] <= L'9') || src[i] == L'.' ||
+                                  src[i] == L'e' || src[i] == L'E' || src[i] == L'-' || src[i] == L'+'))
+            ++i;
+        if (i == start) return false;
+        v.t = JVal::NUM;
+        v.num = wcstod(src.substr(start, i - start).c_str(), nullptr);
+        return true;
+    }
+};
+
+static bool ParseJsonUtf8(const std::string& utf8, JVal& out) {
+    if (utf8.empty()) return false;
+    std::wstring wide = U82W(utf8);
+    JsonParser p(wide);
+    if (!p.parseValue(out)) return false;
+    return true;
+}
+
+static std::string ReadFileUtf8(const std::wstring& path) {
+    FILE* fp = _wfopen(path.c_str(), L"rb");
+    if (!fp) return std::string();
+    std::string data;
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) data.append(buf, n);
+    fclose(fp);
+    return data;
+}
+
+// ============================================================================
+//  版本清单解析：rules 过滤 / inheritsFrom 继承 / 类路径与 natives 收集
+// ============================================================================
+static bool RulesAllow(const JVal* rules) {
+    if (!rules || rules->t != JVal::ARR || rules->a.empty()) return true;
+    bool allow = false;                       // 出现 rules 时默认禁止，最后一条命中者生效
+    for (size_t i = 0; i < rules->a.size(); ++i) {
+        const JVal& r = rules->a[i];
+        bool match = true;
+
+        const JVal* feat = r.get(L"features");
+        if (feat && feat->t == JVal::OBJ && !feat->o.empty()) match = false;  // 不支持可选特性
+
+        const JVal* os = r.get(L"os");
+        if (os && os->t == JVal::OBJ) {
+            std::wstring name = os->str(L"name");
+            std::wstring arch = os->str(L"arch");
+            if (!name.empty() && name != L"windows") match = false;
+            if (!arch.empty() && arch != L"x86_64")  match = false;
+        }
+        if (match) allow = (r.str(L"action") == L"allow");
+    }
+    return allow;
+}
+
+// name = group:artifact:version[:classifier] -> 相对 libraries 的路径
+static std::wstring MavenRel(const std::wstring& name, const std::wstring& classifier) {
+    std::vector<std::wstring> parts;
+    size_t start = 0;
+    for (;;) {
+        size_t p = name.find(L':', start);
+        if (p == std::wstring::npos) { parts.push_back(name.substr(start)); break; }
+        parts.push_back(name.substr(start, p - start));
+        start = p + 1;
+    }
+    if (parts.size() < 3) return L"";
+    std::wstring group = parts[0], artifact = parts[1], version = parts[2];
+    std::wstring cls = classifier.empty() && parts.size() >= 4 ? parts[3] : classifier;
+    std::wstring gpath = group;
+    for (size_t i = 0; i < gpath.size(); ++i)
+        if (gpath[i] == L'.') gpath[i] = L'/';
+    return gpath + L"/" + artifact + L"/" + version + L"/" + artifact + L"-" + version +
+           (cls.empty() ? L"" : (L"-" + cls)) + L".jar";
+}
+
+struct LibEntry {
+    std::wstring key;      // group:artifact，用于跨继承层去重
+    std::wstring rel;      // 相对 libraries 的路径
+    bool native = false;
+};
+
+static void CollectLibs(const JVal& ver, std::vector<LibEntry>& out) {
+    const JVal* libs = ver.get(L"libraries");
+    if (!libs || libs->t != JVal::ARR) return;
+
+    for (size_t i = 0; i < libs->a.size(); ++i) {
+        const JVal& lib = libs->a[i];
+        if (!RulesAllow(lib.get(L"rules"))) continue;
+
+        std::wstring name = lib.str(L"name");
+        const JVal* downloads = lib.get(L"downloads");
+        const JVal* natives = lib.get(L"natives");
+
+        LibEntry e;
+        if (natives && natives->t == JVal::OBJ) {
+            std::wstring cls = natives->str(L"windows");
+            if (cls.empty()) continue;
+            size_t p;
+            while ((p = cls.find(L"${arch}")) != std::wstring::npos) cls.replace(p, 7, L"64");
+            e.native = true;
+            if (downloads) {
+                const JVal* dc = downloads->get(L"classifiers");
+                if (dc) {
+                    const JVal* d = dc->get(cls.c_str());
+                    if (d) e.rel = d->str(L"path");
+                }
+            }
+            if (e.rel.empty()) e.rel = MavenRel(name, cls);
+        } else {
+            size_t c1 = name.find(L':');
+            if (c1 != std::wstring::npos) {
+                size_t c2 = name.find(L':', c1 + 1);
+                e.key = (c2 == std::wstring::npos) ? name : name.substr(0, c2);
+            }
+            if (downloads) {
+                const JVal* art = downloads->get(L"artifact");
+                if (art) e.rel = art->str(L"path");
+            }
+            if (e.rel.empty()) e.rel = MavenRel(name, L"");
+        }
+
+        if (e.rel.empty()) continue;
+        for (size_t k = 0; k < e.rel.size(); ++k)
+            if (e.rel[k] == L'/') e.rel[k] = L'\\';
+
+        // 同一 group:artifact 在子版本里出现时覆盖父版本，位置保持父版本的顺序
+        bool replaced = false;
+        if (!e.key.empty()) {
+            for (size_t k = 0; k < out.size(); ++k) {
+                if (out[k].key == e.key && !out[k].native) { out[k].rel = e.rel; replaced = true; break; }
+            }
+        }
+        if (!replaced) out.push_back(e);
+    }
+}
+
+static void ExpandArgs(const JVal* arr, std::vector<std::wstring>& out) {
+    if (!arr || arr->t != JVal::ARR) return;
+    for (size_t i = 0; i < arr->a.size(); ++i) {
+        const JVal& e = arr->a[i];
+        if (e.t == JVal::STR) { out.push_back(e.s); continue; }
+        if (e.t != JVal::OBJ) continue;
+        if (!RulesAllow(e.get(L"rules"))) continue;
+        const JVal* v = e.get(L"value");
+        if (!v) continue;
+        if (v->t == JVal::STR) out.push_back(v->s);
+        else if (v->t == JVal::ARR)
+            for (size_t k = 0; k < v->a.size(); ++k)
+                if (v->a[k].t == JVal::STR) out.push_back(v->a[k].s);
+    }
+}
+
+typedef std::vector<std::pair<std::wstring, std::wstring>> VarMap;
+
+static std::wstring Subst(std::wstring s, const VarMap& vars) {
+    for (size_t i = 0; i < vars.size(); ++i) {
+        std::wstring key = L"${" + vars[i].first + L"}";
+        size_t p = 0;
+        while ((p = s.find(key, p)) != std::wstring::npos) {
+            s.replace(p, key.size(), vars[i].second);
+            p += vars[i].second.size();
+        }
+    }
+    size_t p;                                  // 剩余未识别占位符一律清空，避免把 ${x} 原样传给 java
+    while ((p = s.find(L"${")) != std::wstring::npos) {
+        size_t q = s.find(L'}', p);
+        if (q == std::wstring::npos) break;
+        s.erase(p, q - p + 1);
+    }
+    return s;
+}
+
+static std::wstring QuoteArg(const std::wstring& s) {
+    if (!s.empty() && s.find(L' ') == std::wstring::npos && s.find(L'\t') == std::wstring::npos)
+        return s;
+    return L"\"" + s + L"\"";
+}
+
+// 离线模式下的稳定 UUID：标准做法是 MD5("OfflinePlayer:"+name)，
+// 这里用 FNV-1a + xorshift 派生 32 位十六进制，格式合法且只依赖昵称。
+static std::wstring OfflineUuid(const std::wstring& name) {
+    unsigned long long h = 1469598103934665603ULL;
+    for (size_t i = 0; i < name.size(); ++i) {
+        h ^= (unsigned long long)(unsigned short)name[i];
+        h *= 1099511628211ULL;
+    }
+    unsigned long long s = h | 1ULL;
+    const wchar_t* hex = L"0123456789abcdef";
+    std::wstring out;
+    out.reserve(32);
+    for (int i = 0; i < 32; ++i) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        out.push_back(hex[(size_t)(s & 0xF)]);
+    }
+    return out;
+}
+
+struct LaunchPlan {
+    bool ok = false;
+    std::wstring id, jarId, mainClass, assetIndex, versionType, nativesDir, command;
+    std::vector<std::wstring> classpath;     // 绝对路径（含 client jar）
+    std::vector<std::wstring> nativeJars;
+};
+
+static LaunchPlan g_plan;
+
+static bool ResolveVersion(const std::wstring& gameDir, const std::wstring& id, LaunchPlan& plan,
+                           std::wstring& err, int& libCount) {
+    // ---- 1) 沿 inheritsFrom 读出整条继承链（leaf -> root）----
+    std::vector<JVal> chain;
+    std::wstring cur = id;
+    for (int depth = 0; depth < 8 && !cur.empty(); ++depth) {
+        std::wstring p = gameDir + L"\\versions\\" + cur + L"\\" + cur + L".json";
+        std::string txt = ReadFileUtf8(p);
+        if (txt.empty()) { err = L"找不到版本清单 " + cur + L".json"; return false; }
+        JVal v;
+        if (!ParseJsonUtf8(txt, v) || v.t != JVal::OBJ) {
+            err = L"版本清单解析失败：" + cur + L".json";
+            return false;
+        }
+        chain.push_back(v);
+        cur = v.str(L"inheritsFrom");
+    }
+
+    // ---- 2) 从 root 往 leaf 合并：子版本的字段覆盖父版本 ----
+    std::wstring mainClass, assetIndex, legacyArgs, jarId, versionType;
+    std::vector<std::wstring> gameArgs, jvmArgs;
+    std::vector<LibEntry> libs;
+
+    for (int k = (int)chain.size() - 1; k >= 0; --k) {
+        const JVal& v = chain[(size_t)k];
+
+        std::wstring mc = v.str(L"mainClass");
+        if (!mc.empty()) mainClass = mc;
+
+        std::wstring t = v.str(L"type");
+        if (!t.empty()) versionType = t;
+
+        const JVal* ai = v.get(L"assetIndex");
+        std::wstring aiId = ai ? ai->str(L"id") : v.str(L"assets");
+        if (!aiId.empty()) assetIndex = aiId;
+
+        std::wstring la = v.str(L"minecraftArguments");
+        if (!la.empty()) legacyArgs = la;
+
+        std::wstring jar = v.str(L"jar");
+        if (!jar.empty()) jarId = jar;
+
+        CollectLibs(v, libs);
+
+        const JVal* args = v.get(L"arguments");
+        if (args) {
+            ExpandArgs(args->get(L"game"), gameArgs);
+            ExpandArgs(args->get(L"jvm"), jvmArgs);
+        }
+    }
+
+    if (mainClass.empty()) { err = L"版本清单缺少 mainClass"; return false; }
+    if (gameArgs.empty() && legacyArgs.empty()) { err = L"版本清单缺少启动参数"; return false; }
+
+    plan.id          = id;
+    plan.jarId       = jarId.empty() ? id : jarId;
+    plan.mainClass   = mainClass;
+    plan.assetIndex  = assetIndex.empty() ? id : assetIndex;
+    plan.versionType = versionType.empty() ? L"release" : versionType;
+    plan.nativesDir  = gameDir + L"\\versions\\" + id + L"\\natives";
+
+    for (size_t i = 0; i < libs.size(); ++i) {
+        std::wstring abs = gameDir + L"\\libraries\\" + libs[i].rel;
+        if (libs[i].native) plan.nativeJars.push_back(abs);
+        else                plan.classpath.push_back(abs);
+    }
+    plan.classpath.push_back(gameDir + L"\\versions\\" + plan.jarId + L"\\" + plan.jarId + L".jar");
+    libCount = (int)plan.classpath.size() + (int)plan.nativeJars.size();
+
+    // ---- 3) 拼装命令行 ----
+    std::wstring java = g_app.javaPath.empty() ? L"java.exe" : g_app.javaPath;
     std::wstring user = g_app.username.empty() ? L"Player" : g_app.username;
 
-    std::wstring cmd;
-    cmd += L"\"" + java + L"\" ";
-    cmd += L"-Xmx" + std::to_wstring(g_app.memGb) + L"G ";
-    cmd += L"-Xms" + std::to_wstring(std::max(1, g_app.memGb / 2)) + L"G ";
-    cmd += L"-Djava.library.path=\"" + dir + L"\\versions\\" + ver + L"\\natives\" ";
-    cmd += L"-cp \"libraries/*;versions\\" + ver + L"\\" + ver + L".jar\" ";
-    cmd += L"net.minecraft.client.main.Main ";
-    cmd += L"--username " + user + L" ";
-    cmd += L"--version " + ver + L" ";
-    cmd += L"--gameDir \"" + dir + L"\" ";
-    cmd += L"--assetsDir \"" + dir + L"\\assets\" ";
-    cmd += L"--accessToken 0 --userType legacy --versionType release";
-    return cmd;
+    std::wstring cp;                          // natives 也放进 classpath：
+    for (size_t i = 0; i < plan.classpath.size(); ++i) {   // LWJGL3 会自行从 jar 内解压原生库，
+        if (!cp.empty()) cp += L";";                       // 这样免去自写 zip 解压
+        cp += plan.classpath[i];
+    }
+    for (size_t i = 0; i < plan.nativeJars.size(); ++i) { cp += L";"; cp += plan.nativeJars[i]; }
+
+    VarMap vars;
+    vars.push_back(std::make_pair(L"auth_player_name",  user));
+    vars.push_back(std::make_pair(L"version_name",      id));
+    vars.push_back(std::make_pair(L"game_directory",    gameDir));
+    vars.push_back(std::make_pair(L"assets_root",       gameDir + L"\\assets"));
+    vars.push_back(std::make_pair(L"assets_index_name", plan.assetIndex));
+    vars.push_back(std::make_pair(L"auth_uuid",         OfflineUuid(user)));
+    vars.push_back(std::make_pair(L"auth_access_token", std::wstring(L"0")));
+    vars.push_back(std::make_pair(L"auth_session",      std::wstring(L"0")));
+    vars.push_back(std::make_pair(L"user_type",         std::wstring(L"legacy")));
+    vars.push_back(std::make_pair(L"version_type",      plan.versionType));
+    vars.push_back(std::make_pair(L"natives_directory", plan.nativesDir));
+    vars.push_back(std::make_pair(L"library_directory", gameDir + L"\\libraries"));
+    vars.push_back(std::make_pair(L"classpath",         cp));
+    vars.push_back(std::make_pair(L"classpath_separator", std::wstring(L";")));
+    vars.push_back(std::make_pair(L"launcher_name",     std::wstring(L"DreamMinecraftLauncher")));
+    vars.push_back(std::make_pair(L"launcher_version",  std::wstring(L"1.0")));
+    vars.push_back(std::make_pair(L"clientid",          std::wstring(L"")));
+    vars.push_back(std::make_pair(L"auth_xuid",         std::wstring(L"")));
+
+    plan.command = QuoteArg(java);
+    plan.command += L" -Xmx" + std::to_wstring(g_app.memGb) + L"G";
+    plan.command += L" -Xms" + std::to_wstring(std::max(1, g_app.memGb / 2)) + L"G";
+
+    if (jvmArgs.empty()) {
+        plan.command += L" -Djava.library.path=" + QuoteArg(plan.nativesDir);
+        plan.command += L" -cp " + QuoteArg(cp);
+    } else {
+        for (size_t i = 0; i < jvmArgs.size(); ++i)
+            plan.command += L" " + QuoteArg(Subst(jvmArgs[i], vars));
+    }
+
+    plan.command += L" " + plan.mainClass;
+
+    if (!gameArgs.empty()) {
+        for (size_t i = 0; i < gameArgs.size(); ++i)
+            plan.command += L" " + QuoteArg(Subst(gameArgs[i], vars));
+    } else {
+        // 旧版 minecraftArguments：空格分隔，占位符替换后再按空格拆分
+        std::wstring rest = legacyArgs;
+        size_t p = 0;
+        while (p < rest.size()) {
+            while (p < rest.size() && rest[p] == L' ') ++p;
+            size_t q = rest.find(L' ', p);
+            if (q == std::wstring::npos) q = rest.size();
+            if (q > p) plan.command += L" " + QuoteArg(Subst(rest.substr(p, q - p), vars));
+            p = q;
+        }
+    }
+
+    plan.ok = true;
+    return true;
+}
+
+// ============================================================================
+//  进程拉起 + stdout/stderr 回灌日志
+// ============================================================================
+static HANDLE g_hChild = nullptr;
+
+struct PipeCtx { HANDLE pipe; HWND hwnd; };
+
+static DWORD WINAPI PipeReader(LPVOID param) {
+    PipeCtx* ctx = (PipeCtx*)param;
+    std::string acc;
+    char buf[4096];
+    DWORD n = 0;
+    while (ReadFile(ctx->pipe, buf, sizeof(buf) - 1, &n, nullptr) && n > 0) {
+        buf[n] = '\0';
+        acc.append(buf, n);
+        size_t pos;
+        while ((pos = acc.find('\n')) != std::string::npos) {
+            std::string line = acc.substr(0, pos);
+            acc.erase(0, pos + 1);
+            if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+            if (!line.empty())
+                PostMessageW(ctx->hwnd, WM_APP_LOG, 0, (LPARAM)new std::wstring(DecodeChild(line)));
+        }
+        if (acc.size() > 16384) acc.clear();
+    }
+    if (!acc.empty())
+        PostMessageW(ctx->hwnd, WM_APP_LOG, 0, (LPARAM)new std::wstring(DecodeChild(acc)));
+    CloseHandle(ctx->pipe);
+    delete ctx;
+    return 0;
+}
+
+static bool SpawnGame(const std::wstring& cmd, const std::wstring& cwd, std::wstring& err) {
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) { err = L"创建输出管道失败"; return false; }
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                             OPEN_EXISTING, 0, nullptr);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError  = wr;
+    si.hStdInput  = nul;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(L'\0');
+
+    BOOL ok = CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+                            nullptr, cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+    DWORD lastErr = GetLastError();
+
+    CloseHandle(wr);
+    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+
+    if (!ok) {
+        CloseHandle(rd);
+        err = L"CreateProcess 失败（错误码 " + std::to_wstring((unsigned)lastErr) + L"）";
+        return false;
+    }
+
+    if (g_hChild) { CloseHandle(g_hChild); g_hChild = nullptr; }
+    g_hChild = pi.hProcess;
+    CloseHandle(pi.hThread);
+
+    PipeCtx* ctx = new PipeCtx{ rd, g_app.hwnd };
+    HANDLE th = CreateThread(nullptr, 0, PipeReader, ctx, 0, nullptr);
+    if (th) CloseHandle(th);
+    return true;
+}
+
+// ============================================================================
+//  启动流程（真实拉起 Java）
+//  ---------------------------------------------------------------------------
+//  已实现：version.json 继承链解析、rules(OS) 过滤、libraries 归类路径、
+//          natives 处理、占位符替换、CreateProcessW 拉起、stdout 回灌日志。
+//  未实现（见 README「已知限制」）：微软账号鉴权（当前为离线模式）、
+//          libraries / assets 缺失文件的自动下载、assets 完整性校验。
+// ============================================================================
+static std::wstring EffectiveGameDir() {
+    return g_app.gameDir.empty() ? DefaultMinecraftDir() : g_app.gameDir;
+}
+
+static std::wstring CurrentVersionId() {
+    if (g_app.versions.empty()) return L"";
+    int idx = g_app.versionIdx;
+    if (idx < 0 || idx >= (int)g_app.versions.size()) idx = 0;
+    return g_app.versions[(size_t)idx];
+}
+
+// 统计缺失文件，返回缺失数量
+static int CountMissing(const LaunchPlan& plan, std::wstring& firstMissing) {
+    int missing = 0;
+    for (size_t i = 0; i < plan.classpath.size(); ++i) {
+        if (!PathExists(plan.classpath[i])) {
+            if (missing == 0) firstMissing = plan.classpath[i];
+            ++missing;
+        }
+    }
+    for (size_t i = 0; i < plan.nativeJars.size(); ++i) {
+        if (!PathExists(plan.nativeJars[i])) {
+            if (missing == 0) firstMissing = plan.nativeJars[i];
+            ++missing;
+        }
+    }
+    return missing;
 }
 
 static const wchar_t* kLaunchSteps[] = {
-    L"校验账户信息 …",
+    L"校验账户信息（离线模式）…",
     L"读取版本清单 version.json …",
-    L"检查资源索引 assets …",
-    L"整理类路径 libraries …",
+    L"检查依赖文件 libraries …",
+    L"整理类路径与启动参数 …",
     L"启动 Java 进程 …"
 };
+static const int kLaunchStepCount = 5;
+static int g_stepLibCount = 0;
+
+static void AbortLaunch(const std::wstring& why) {
+    g_app.launching = false;
+    g_app.launched  = false;
+    g_app.progress  = 0.0f;
+    g_app.step      = 0;
+    g_app.resetTick = 0;
+    PushLog(L"启动失败：" + why);
+}
+
+// 执行第 step 步的真实工作，返回 false 表示中止
+static bool RunLaunchStep(int step) {
+    std::wstring gameDir = EffectiveGameDir();
+
+    switch (step) {
+    case 0: {
+        if (g_app.javaPath.empty()) {
+            AbortLaunch(L"未检测到 Java，请安装 JRE/JDK 或设置 JAVA_HOME");
+            return false;
+        }
+        PushLog(L"离线账户 · " + g_app.username);
+        return true;
+    }
+    case 1: {
+        std::wstring id = CurrentVersionId();
+        if (id.empty())       { AbortLaunch(L"没有可用的游戏版本"); return false; }
+        if (gameDir.empty())  { AbortLaunch(L"未找到 .minecraft 游戏目录"); return false; }
+
+        std::wstring err;
+        int libCount = 0;
+        if (!ResolveVersion(gameDir, id, g_plan, err, libCount)) {
+            AbortLaunch(err);
+            return false;
+        }
+        g_stepLibCount = libCount;
+        PushLog(L"版本 " + id + L" · " + g_plan.mainClass);
+        return true;
+    }
+    case 2: {
+        std::wstring first;
+        int missing = CountMissing(g_plan, first);
+        if (missing > 0) {
+            AbortLaunch(L"缺少 " + std::to_wstring(missing) +
+                        L" 个依赖文件，请先用官方启动器安装该版本");
+            PushLog(first);
+            return false;
+        }
+        std::wstring idxPath = gameDir + L"\\assets\\indexes\\" + g_plan.assetIndex + L".json";
+        if (PathExists(idxPath))
+            PushLog(L"依赖文件完整 · 共 " + std::to_wstring(g_stepLibCount) + L" 项");
+        else
+            PushLog(L"警告：缺少资源索引 " + g_plan.assetIndex + L".json（可进游戏但无音效/贴图）");
+        return true;
+    }
+    case 3: {
+        PushLog(L"类路径 " + std::to_wstring(g_plan.classpath.size()) + L" 项 · natives " +
+                std::to_wstring(g_plan.nativeJars.size()) + L" 项");
+        return true;
+    }
+    case 4: {
+        CreateDirectoryW(g_plan.nativesDir.c_str(), nullptr);
+
+        // 把最终命令行落盘，便于排查启动问题
+        CreateDirectoryW(AppDataConfigDir().c_str(), nullptr);
+        FILE* fp = _wfopen((AppDataConfigDir() + L"\\last-command.txt").c_str(), L"wb");
+        if (fp) {
+            std::string u8 = W2U8(g_plan.command);
+            fwrite(u8.data(), 1, u8.size(), fp);
+            fclose(fp);
+        }
+
+        std::wstring err;
+        if (!SpawnGame(g_plan.command, gameDir, err)) {
+            AbortLaunch(err);
+            return false;
+        }
+        PushLog(L"Java 已拉起 · 等待游戏窗口 …");
+        return true;
+    }
+    }
+    return true;
+}
 
 static void StartLaunch() {
     if (g_app.launching) return;
@@ -428,20 +1073,31 @@ static void StartLaunch() {
         g_app.focus = FOCUS_USER;
         return;
     }
+    if (g_hChild) { CloseHandle(g_hChild); g_hChild = nullptr; }
+
     g_app.launching = true;
     g_app.launched  = false;
     g_app.progress  = 0.0f;
     g_app.step      = 0;
+    g_app.resetTick = 0;
+    for (int i = 0; i < kLaunchStepCount; ++i) g_app.stepRan[i] = false;
     g_app.logs.clear();
+    g_plan = LaunchPlan();
     PushLog(kLaunchSteps[0]);
 }
 
 static void FinishLaunch() {
     g_app.launching = false;
-    g_app.launched  = true;
-    g_app.resetTick = 30;    // 约 3 秒后按钮复位
-    PushLog(L"启动完成 · 已生成启动命令行（示例流程）");
-    PushLog(BuildLaunchCommand());
+    g_app.progress  = 100.0f;
+    // 进程若已提前退出（启动失败），退出提示已经打过，这里不再谎报「已启动」
+    if (g_hChild) {
+        g_app.launched  = true;
+        g_app.resetTick = 30;    // 约 3 秒后按钮复位
+        PushLog(L"已启动 · 游戏输出会显示在这里");
+    } else {
+        g_app.launched  = false;
+        g_app.resetTick = 0;
+    }
     SaveConfig();
 }
 
@@ -846,21 +1502,51 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         Paint(hwnd);
         return 0;
 
+    case WM_APP_LOG: {
+        std::wstring* line = (std::wstring*)lParam;
+        if (line) {
+            PushLog(*line);
+            delete line;
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+
     case WM_TIMER: {
         if (wParam != 1) break;
         g_app.caretTick++;
         if (g_app.caretTick % 5 == 0) g_app.caretOn = !g_app.caretOn;
 
+        // 游戏进程退出检测
+        if (g_hChild && WaitForSingleObject(g_hChild, 0) == WAIT_OBJECT_0) {
+            DWORD code = 0;
+            GetExitCodeProcess(g_hChild, &code);
+            CloseHandle(g_hChild);
+            g_hChild = nullptr;
+            g_app.launched  = false;
+            g_app.resetTick = 0;
+            PushLog(L"游戏进程已退出（退出码 " + std::to_wstring((unsigned)code) + L"）");
+        }
+
         if (g_app.launching) {
-            g_app.progress += 2.5f;
-            if (g_app.progress >= 100.0f) {
-                g_app.progress = 100.0f;
-                FinishLaunch();
-            } else {
-                int step = (int)(g_app.progress / 20.0f);
-                if (step > g_app.step && step < 5) {
-                    g_app.step = step;
-                    PushLog(kLaunchSteps[step]);
+            int step = g_app.step;
+            if (!g_app.stepRan[step]) {
+                // 失败时 AbortLaunch 已重置状态，这里直接返回
+                if (!RunLaunchStep(step)) {
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                g_app.stepRan[step] = true;
+            }
+            g_app.progress += 4.0f;              // 每秒 40%，5 步合计约 2.5 秒
+            float cap = (float)(step + 1) * 20.0f;
+            if (g_app.progress >= cap) {
+                g_app.progress = cap;
+                if (step + 1 >= kLaunchStepCount) {
+                    FinishLaunch();
+                } else {
+                    g_app.step = step + 1;
+                    PushLog(kLaunchSteps[step + 1]);
                 }
             }
         } else if (g_app.launched && g_app.resetTick > 0) {
