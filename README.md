@@ -1,4 +1,4 @@
-# Dream Minecraft Launcher (DML) —— 极简 Minecraft 启动器示例（C++）
+# Dream Minecraft Launcher (DML) —— 极简 Minecraft 启动器（C++）
 
 <p align="center">
   <img src="assets/logo/dml-lockup.png" alt="Dream Minecraft Launcher" width="520">
@@ -15,7 +15,7 @@
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ ▉ Dream Minecraft Launcher                       ─    ✕      │
-│   DML · 示例启动器 · C++ / Win32 / GDI+                      │
+│   DML                                                        │
 │ ┌──────────────────────────────────────────────────────────┐ │
 │ │ 玩家昵称              游戏版本                            │ │
 │ │ ┌──────────────┐     ┌────────────────────┐              │ │

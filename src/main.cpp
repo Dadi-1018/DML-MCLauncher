@@ -1,5 +1,5 @@
 // ============================================================================
-//  Dream Minecraft Launcher (DML) —— 极简 Minecraft 启动器示例
+//  Dream Minecraft Launcher (DML) —— 极简 Minecraft 启动器
 //  ---------------------------------------------------------------------------
 //  · 纯 Win32 API + GDI+ 手绘界面，无任何第三方 UI 库，单文件实现
 //  · 无边框圆角窗口、自绘输入框 / 下拉框 / 滑块 / 按钮 / 日志面板
@@ -1233,7 +1233,7 @@ static void Paint(HWND hwnd) {
         DrawLogo(gr, L.logo);
         DrawStr(gr, L"Dream Minecraft Launcher", RectF(S(80), S(14), S(460), S(28)),
                 *F.title, C(Theme::Text));
-        DrawStr(gr, L"DML · 示例启动器 · C++ / Win32 / GDI+",
+        DrawStr(gr, L"DML",
                 RectF(S(81), S(44), S(460), S(18)), *F.sub, C(Theme::Muted));
         DrawWindowButtons(gr, L);
 
