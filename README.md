@@ -5,12 +5,13 @@
 </p>
 
 一个**纯 C++ / Win32 / GDI+** 编写的 Minecraft 启动器：无第三方 UI 库、无运行时依赖，
-编译产物只有一个 exe。界面为深色、无边框圆角窗口，所有控件（输入框、下拉框、滑块、按钮、
-日志面板）均为手工绘制。
+编译产物只有一个 exe。界面为**浅色**（白底 + 浅蓝账号胶囊 + 草绿强调）、无边框圆角窗口，
+所有控件（输入框、下拉框、滑块、按钮、日志面板）均为手工绘制。
 
 它**能真的把游戏启动起来**：自己解析 `version.json`（含 `inheritsFrom` 继承与 `rules` 过滤）、
-拼出完整 `java` 命令行、拉起进程并把游戏输出回灌到界面日志。当前为离线模式，
-不接账号鉴权、不自动下载资源（详见[真实启动](#真实启动)与[已知限制](#已知限制)）。
+拼出完整 `java` 命令行、拉起进程并把游戏输出回灌到界面日志。账号支持**离线**与
+**微软账号（设备码授权）**两种模式，默认离线；不自动下载缺失的 libraries / assets
+（详见[真实启动](#真实启动)与[已知限制](#已知限制)）。
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -20,6 +21,7 @@
 │ │ ┌──────────────┐     ┌────────────────────┐              │ │
 │ │ │ Steve        │     │ 1.20.4          ▾ │              │ │
 │ │ └──────────────┘     └────────────────────┘              │ │
+│ │ (离线登录) (微软登录)                                    │ │
 │ │ 内存分配                                           4 GB   │ │
 │ │ ●──────────────────────────────────────────────          │ │
 │ └──────────────────────────────────────────────────────────┘ │
@@ -48,8 +50,8 @@
 
 ## 品牌资源
 
-标志取 **Dream Minecraft Launcher** 的缩写 **DML**，圆角应用方块 + 粗体字母组合 + 渐变，
-配色跟随应用主题（深色底 / 草绿 `#4ADE80`）。
+标志取 **Dream Minecraft Launcher** 的缩写 **DML**，圆角应用方块 + 粗体字母组合 + 渐变。
+标志自身是深色底 + 草绿渐变字，放在浅色界面里作为对比鲜明的应用图标。
 
 | 文件 | 用途 |
 |---|---|
@@ -71,7 +73,7 @@
 
 ```
 MCLaucher/
-├─ src/main.cpp        # 全部源码（约 1050 行，单文件）
+├─ src/main.cpp        # 全部源码（约 2700 行，单文件）
 ├─ src/resource.h      # 资源 ID（app.rc 与 main.cpp 共用）
 ├─ res/app.rc          # 资源脚本：图标 + 页眉标志
 ├─ assets/logo/        # 标志源文件与生成脚本
@@ -141,8 +143,12 @@ cmake --build out --config Release
 | 内存滑块 | 1–16 GB 拖动调节，按下即跟随鼠标并捕获输入 |
 | 环境探测 | 扫描 `.minecraft\versions\*\*.json` 得到真实版本列表；`JAVA_HOME` 与常见安装目录探测 Java |
 | 目录选择 | `SHBrowseForFolder` 选择游戏目录，切换后自动重扫版本 |
+| 账号登录 | 昵称框下方「离线登录 / 微软登录」两个胶囊（默认离线）；微软走设备码授权 → XBL → XSTS → Minecraft Services，成功后用**正版游戏 ID** 覆盖昵称，启动时注入真实 `accessToken` / `uuid` / `xuid` |
+| 令牌安全 | refresh token 经 DPAPI（`CryptProtectData`）加密后落盘，下次启动静默续期；access token 只留在内存 |
+| 验证码弹窗 | 码就绪即复制到剪贴板并弹出卡片（160ms ease-out 动画），倒计时 5 秒后自动唤起浏览器，点「重新打开浏览器」可立即打开 |
+| 浅色主题 | 白底深字 + 浅蓝账号胶囊 + 草绿强调，配色集中在 `Theme` 命名空间，改一处即可整体换肤 |
 | 配置持久化 | 退出/修改时写入 `%APPDATA%\DreamMinecraftLauncher\config.ini`（UTF-8） |
-| 启动流程 | 5 个真实步骤（校验账户 → 读版本清单 → 查依赖 → 整理参数 → 拉起 Java），按钮内进度条动画 |
+| 启动流程 | 5 个真实步骤（校验账户 → 读版本清单 → 查依赖 → 整理参数 → 拉起 Java），按钮内进度条 16ms 一帧平滑推进 |
 | 版本清单解析 | 自带极简 JSON 解析器；支持 `inheritsFrom` 继承链合并、`rules` 的 `os.name` / `os.arch` / `features` 过滤 |
 | 类路径与 natives | 按 maven 坐标还原 jar 路径，同 `group:artifact` 去重（子版本覆盖父版本）；natives jar 一并加入 `classpath`（LWJGL3 会自行从 jar 内解压原生库） |
 | 占位符替换 | `${auth_player_name}` `${version_name}` `${game_directory}` `${assets_index_name}` `${classpath}` 等全套替换，未知占位符清空 |
@@ -152,7 +158,7 @@ cmake --build out --config Release
 ## 快捷键
 
 - `Enter` 启动游戏
-- `Esc` 关闭版本下拉浮层
+- `Esc` 关闭版本下拉浮层 / 验证码弹窗
 - 光标在昵称框内时可正常输入 / 退格
 
 ## 代码导读（`src/main.cpp`）
@@ -176,8 +182,14 @@ ResolveVersion  解析继承链、合并 libraries、替换占位符、拼出完
 OfflineUuid     由昵称派生稳定 UUID
 SpawnGame       CreateProcessW 拉起 java，管道回灌输出
 PipeReader      子进程 stdout/stderr → WM_APP_LOG（UTF-8/GBK 自动判别）
-RunLaunchStep   启动流程的单步真实动作（由 WM_TIMER 驱动）
-Paint           绘制入口（先背景 → 卡片 → 控件 → 浮层）
+LaunchTick      启动状态机单步：跑当前步骤 / 进度满则推进下一步
+--- 微软账号 ---
+HttpsPost       WinHTTP 手写 POST（取设备码 / 换令牌链）
+MsLoginThread   设备码授权 → XBL → XSTS → Minecraft Services → 档案
+MsRefreshThread 用 DPAPI 解出来的 refresh token 静默续期
+DrawAuthPill    昵称框下方「离线登录 / 微软登录」浅蓝胶囊
+DrawMsDialog    验证码弹窗（scrim + 卡片滑入，ease-out 动画）
+Paint           绘制入口（先背景 → 卡片 → 控件 → 浮层 → 弹窗）
 WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动 / 启动进度
 ```
 
@@ -187,7 +199,7 @@ WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动 / 启动�
 
 | 步骤 | 实际动作 |
 |---|---|
-| 校验账户信息 | 检查 Java 是否可用，生成离线 UUID |
+| 校验账户信息 | 检查 Java 是否可用；离线模式派生稳定 UUID，微软账号注入真实 `accessToken` / `uuid` / `xuid` |
 | 读取版本清单 | 解析 `versions\<v>\<v>.json`，沿 `inheritsFrom` 合并继承链 |
 | 检查依赖文件 | 逐个校验 `libraries` / 客户端 jar 是否存在，缺失就中止并列出首个缺失路径 |
 | 整理类路径与参数 | 拼 `-cp`、替换全部占位符，逐参数转义 |
@@ -195,13 +207,18 @@ WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动 / 启动�
 
 成功拉起后，最终命令行会写到 `%APPDATA%\DreamMinecraftLauncher\last-command.txt`，方便排查启动失败。
 
-**当前是离线模式**，因此这些还没做（见下方「已知限制」）：
+账号模式由昵称框下方的两个胶囊决定，进入即默认**离线登录**：
 
-1. **鉴权**：没有接微软 OAuth 设备码流程，`--accessToken` / `--uuid` 用离线占位值，
-   进不了正版服务器。
-2. **资源补全**：不下载缺失的 `libraries` / `assets`，如果版本没装全，
+- **离线登录**：`--accessToken` 用占位值 `0`，`--uuid` 由昵称经 FNV-1a 派生，只能玩单人 / 离线服。
+- **微软登录**：设备码授权拿 refresh token（DPAPI 加密后存 `account.dat`），再走
+  XBL → XSTS → Minecraft Services 换出真实 access token；登录成功后昵称框显示**正版游戏 ID**
+  （不再额外展示 UUID），启动时注入真实的 `accessToken` / `uuid` / `xuid`，可进正版服务器。
+
+还没做的（见下方「已知限制」）：
+
+1. **资源补全**：不下载缺失的 `libraries` / `assets`，如果版本没装全，
    启动会直接报「缺少 N 个依赖文件」，请先用官方启动器把该版本装好。
-3. **natives 解压**：不自己解压 natives jar，而是把 natives jar 加进 `classpath`，
+2. **natives 解压**：不自己解压 natives jar，而是把 natives jar 加进 `classpath`，
    由 LWJGL3 在加载时自行从 jar 内提取原生库。这套做法对 1.13+ 有效；
    更老的 LWJGL2 版本仍需真实解压到 `versions\<v>\natives`。
 
@@ -209,7 +226,8 @@ WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动 / 启动�
 
 ## 已知限制
 
-- 启动为**离线模式**：不登录、不下载资源、不校验 assets 完整性。
+- 不自动下载 `libraries` / `assets`，也不校验 assets 完整性。
+- 微软账号只完成登录，不校验游戏所有权（跳过 `/entitlements`）。
 - 版本没装全时不会自动补齐，只会提示缺多少个依赖文件（首个路径会显示在日志里）。
 - 无边框窗口不支持拖拽缩放（启动器一般也不需要）。
 - 版本列表只认 `versions\*\*.json` 存在的目录，未安装任何版本时回退到内置示例列表

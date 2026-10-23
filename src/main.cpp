@@ -21,6 +21,9 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shlobj.h>
+#include <shellapi.h>
+#include <winhttp.h>
+#include <wincrypt.h>
 #include <gdiplus.h>
 
 #include "resource.h"   // IDI_APPICON / IDR_LOGO
@@ -39,33 +42,43 @@ using namespace Gdiplus;
 
 // 子进程输出回灌：LPARAM 是 new 出来的 std::wstring*，处理完需 delete
 #define WM_APP_LOG (WM_APP + 1)
+// 微软登录线程 → UI：wParam = 1 设备码就绪 / 2 流程结束（成功或失败，看 g_msShared.ok）
+#define WM_APP_MS  (WM_APP + 2)
 
 #ifdef _MSC_VER
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "uuid.lib")
 #endif
 
 // ============================================================================
-//  主题配色（深色，贴近现代启动器观感）
+//  主题配色（浅色：白底深字 + 浅蓝账号胶囊 + 绿色游戏强调色）
 // ============================================================================
 namespace Theme {
-    const DWORD Bg          = RGB(0x14, 0x16, 0x1A);
-    const DWORD Panel       = RGB(0x1B, 0x1E, 0x24);
-    const DWORD PanelBorder = RGB(0x28, 0x2D, 0x36);
-    const DWORD Field       = RGB(0x23, 0x27, 0x2E);
-    const DWORD FieldHover  = RGB(0x2B, 0x30, 0x39);
-    const DWORD Border      = RGB(0x2E, 0x33, 0x3C);
-    const DWORD Text        = RGB(0xE7, 0xEA, 0xF0);
-    const DWORD Muted       = RGB(0x8B, 0x93, 0x9F);
-    const DWORD Dim         = RGB(0x5B, 0x63, 0x6F);
-    const DWORD Accent      = RGB(0x4A, 0xDE, 0x80);
-    const DWORD AccentSoft  = RGB(0x2F, 0x8F, 0x57);
-    const DWORD OnAccent    = RGB(0x0B, 0x14, 0x0F);
+    const DWORD Bg          = RGB(0xF5, 0xF7, 0xFB);   // 页面底色（近白）
+    const DWORD Panel       = RGB(0xFF, 0xFF, 0xFF);   // 卡片白
+    const DWORD PanelBorder = RGB(0xE4, 0xE9, 0xF1);
+    const DWORD Field       = RGB(0xF4, 0xF6, 0xFA);   // 输入框底色
+    const DWORD FieldHover  = RGB(0xEA, 0xF0, 0xF9);
+    const DWORD Border      = RGB(0xDC, 0xE2, 0xEC);
+    const DWORD Text        = RGB(0x1B, 0x20, 0x28);
+    const DWORD Muted       = RGB(0x5D, 0x67, 0x76);
+    const DWORD Dim         = RGB(0x93, 0x9D, 0xAC);
+    const DWORD Accent      = RGB(0x24, 0xA8, 0x62);   // 绿色强调（滑块 / 版本 / 启动）
+    const DWORD AccentSoft  = RGB(0x1D, 0x8F, 0x54);
+    const DWORD OnAccent    = RGB(0xFF, 0xFF, 0xFF);   // 强调色底上的字
     const DWORD Grass       = RGB(0x54, 0xA6, 0x4B);
     const DWORD Dirt        = RGB(0x8B, 0x6A, 0x4A);
-    const DWORD Track       = RGB(0x2A, 0x2F, 0x37);
+    const DWORD Track       = RGB(0xE7, 0xEB, 0xF2);
     const DWORD Danger      = RGB(0xE0, 0x4C, 0x4C);
+    // 账号胶囊 / 微软相关：浅蓝
+    const DWORD PillBg      = RGB(0xE3, 0xEF, 0xFE);   // 选中胶囊底色
+    const DWORD PillBorder  = RGB(0xA6, 0xC6, 0xF5);
+    const DWORD PillText    = RGB(0x1C, 0x61, 0xD4);
 }
 
 static Color C(DWORD rgb, BYTE a = 255) {
@@ -194,6 +207,12 @@ static void FreeFonts() {
 // ============================================================================
 struct Layout {
     RectF logo;
+    RectF msOffBtn;      // 昵称框下方：离线登录 / 微软登录 两个选项
+    RectF msOnBtn;
+    RectF msUnbind;      // 仅已登录时显示
+    RectF dlgCard;       // 验证码弹窗
+    RectF dlgOpen;
+    RectF dlgOk;
     RectF panel1;
     RectF panel2;
     RectF userBox;
@@ -212,12 +231,18 @@ static const int WIN_H = 500;
 static Layout ComputeLayout() {
     Layout L;
     L.logo        = RectF(S(28),  S(20),  S(40),  S(40));
+    L.msOffBtn    = RectF(S(52),  S(172), S(78),  S(22));
+    L.msOnBtn     = RectF(S(136), S(172), S(78),  S(22));
+    L.msUnbind    = RectF(S(222), S(168), S(84),  S(30));
+    L.dlgCard     = RectF(S(150), S(140), S(460), S(212));
+    L.dlgOpen     = RectF(S(247), S(296), S(150), S(34));
+    L.dlgOk       = RectF(S(409), S(296), S(104), S(34));
     L.minBtn      = RectF(S(662), S(16),  S(30),  S(30));
     L.closeBtn    = RectF(S(700), S(16),  S(30),  S(30));
     L.panel1      = RectF(S(28),  S(82),  S(704), S(166));
     L.userBox     = RectF(S(52),  S(126), S(300), S(42));
     L.verBox      = RectF(S(376), S(126), S(332), S(42));
-    L.sliderTrack = RectF(S(52),  S(210), S(656), S(6));
+    L.sliderTrack = RectF(S(52),  S(224), S(656), S(6));
     L.panel2      = RectF(S(28),  S(262), S(704), S(66));
     L.browseBtn   = RectF(S(636), S(278), S(72),  S(34));
     L.launchBtn   = RectF(S(28),  S(340), S(704), S(50));
@@ -228,7 +253,8 @@ static Layout ComputeLayout() {
 // ============================================================================
 //  应用状态
 // ============================================================================
-enum { HIT_NONE = 0, HIT_CLOSE, HIT_MIN, HIT_USER, HIT_VER, HIT_SLIDER, HIT_BROWSE, HIT_LAUNCH };
+enum { HIT_NONE = 0, HIT_CLOSE, HIT_MIN, HIT_USER, HIT_VER, HIT_SLIDER, HIT_BROWSE, HIT_LAUNCH,
+       HIT_MS_OFF, HIT_MS_ON, HIT_MS_UNBIND };
 enum { FOCUS_NONE = 0, FOCUS_USER };
 
 static const int DD_ITEM_H   = 34;   // 下拉项高度（逻辑像素）
@@ -260,13 +286,41 @@ struct AppState {
 
     bool  launching = false;
     bool  launched  = false;
-    float progress  = 0.0f;
+    float progress  = 0.0f;          // 实际绘制用的进度（由 16ms 定时器平滑逼近 progressTarget）
+    float progressTarget = 0.0f;     // 当前步骤的进度目标
     int   step      = 0;
     int   resetTick = 0;
     bool  stepRan[5] = { false, false, false, false, false };  // 该步的真实工作是否已执行
+    bool  msDlg     = false;         // 微软登录验证码弹窗（逻辑开关）
+    float msAnim    = 0.0f;          // 弹窗动画进度 0..1
+    int   dlgWait   = 0;             // 弹窗停留后打开浏览器的倒计时（秒，0 = 已开）
 };
 
 static AppState g_app;
+
+// ============================================================================
+//  微软账号状态
+//    LOGGED_OUT → WAITING（等用户在浏览器输码）→ WORKING（换令牌链）→ LOGGED_IN
+//    任何一步失败都回到 LOGGED_OUT 并把原因写进 g_ms.err
+// ============================================================================
+enum MsState { MS_LOGGED_OUT = 0, MS_WAITING, MS_WORKING, MS_LOGGED_IN };
+
+struct MsAccount {
+    MsState      state = MS_LOGGED_OUT;
+    std::wstring name;          // Minecraft 用户名（登录后覆盖昵称框）
+    std::wstring uuid;          // 去横线的 32 位 uuid
+    std::wstring xuid;
+    std::wstring accessToken;   // Minecraft access token（只在内存里，不落盘）
+    std::wstring refreshToken;  // 微软 refresh token（DPAPI 加密后落盘）
+    std::wstring userCode;      // 设备码，展示给用户
+    std::wstring verifyUri;     // 输码网址
+    std::wstring err;           // 失败原因
+};
+
+static MsAccount g_ms;
+
+// 离线昵称：与「登录后显示的 MC 用户名」分开存，退出登录时能还原
+static std::wstring g_offlineName = L"Steve";
 
 // ============================================================================
 //  路径 / 配置
@@ -301,7 +355,7 @@ static void SaveConfig() {
     CreateDirectoryW(dir.c_str(), nullptr);
     std::ofstream f(W2U8(ConfigPath()).c_str());
     if (!f) return;
-    f << "username=" << W2U8(g_app.username) << "\n";
+    f << "username=" << W2U8(g_offlineName) << "\n";
     f << "version="  << W2U8(g_app.versions.empty() ? std::wstring() : g_app.versions[(size_t)g_app.versionIdx]) << "\n";
     f << "memory="   << g_app.memGb << "\n";
     f << "gamedir="  << W2U8(g_app.gameDir) << "\n";
@@ -796,7 +850,11 @@ static bool ResolveVersion(const std::wstring& gameDir, const std::wstring& id, 
 
     // ---- 3) 拼装命令行 ----
     std::wstring java = g_app.javaPath.empty() ? L"java.exe" : g_app.javaPath;
-    std::wstring user = g_app.username.empty() ? L"Player" : g_app.username;
+    // 登录了微软账号就用真令牌，否则退回离线占位值
+    const bool msa = (g_ms.state == MS_LOGGED_IN && !g_ms.accessToken.empty());
+    std::wstring user = msa ? g_ms.name
+                            : (g_offlineName.empty() ? std::wstring(L"Player") : g_offlineName);
+    const std::wstring token = msa ? g_ms.accessToken : std::wstring(L"0");
 
     std::wstring cp;                          // natives 也放进 classpath：
     for (size_t i = 0; i < plan.classpath.size(); ++i) {   // LWJGL3 会自行从 jar 内解压原生库，
@@ -811,10 +869,10 @@ static bool ResolveVersion(const std::wstring& gameDir, const std::wstring& id, 
     vars.push_back(std::make_pair(L"game_directory",    gameDir));
     vars.push_back(std::make_pair(L"assets_root",       gameDir + L"\\assets"));
     vars.push_back(std::make_pair(L"assets_index_name", plan.assetIndex));
-    vars.push_back(std::make_pair(L"auth_uuid",         OfflineUuid(user)));
-    vars.push_back(std::make_pair(L"auth_access_token", std::wstring(L"0")));
-    vars.push_back(std::make_pair(L"auth_session",      std::wstring(L"0")));
-    vars.push_back(std::make_pair(L"user_type",         std::wstring(L"legacy")));
+    vars.push_back(std::make_pair(L"auth_uuid",         msa ? g_ms.uuid : OfflineUuid(user)));
+    vars.push_back(std::make_pair(L"auth_access_token", token));
+    vars.push_back(std::make_pair(L"auth_session",      token));
+    vars.push_back(std::make_pair(L"user_type",         std::wstring(msa ? L"msa" : L"legacy")));
     vars.push_back(std::make_pair(L"version_type",      plan.versionType));
     vars.push_back(std::make_pair(L"natives_directory", plan.nativesDir));
     vars.push_back(std::make_pair(L"library_directory", gameDir + L"\\libraries"));
@@ -823,7 +881,7 @@ static bool ResolveVersion(const std::wstring& gameDir, const std::wstring& id, 
     vars.push_back(std::make_pair(L"launcher_name",     std::wstring(L"DreamMinecraftLauncher")));
     vars.push_back(std::make_pair(L"launcher_version",  std::wstring(L"1.0")));
     vars.push_back(std::make_pair(L"clientid",          std::wstring(L"")));
-    vars.push_back(std::make_pair(L"auth_xuid",         std::wstring(L"")));
+    vars.push_back(std::make_pair(L"auth_xuid",         msa ? g_ms.xuid : std::wstring(L"")));
 
     plan.command = QuoteArg(java);
     plan.command += L" -Xmx" + std::to_wstring(g_app.memGb) + L"G";
@@ -988,6 +1046,7 @@ static void AbortLaunch(const std::wstring& why) {
     g_app.launching = false;
     g_app.launched  = false;
     g_app.progress  = 0.0f;
+    g_app.progressTarget = 0.0f;
     g_app.step      = 0;
     g_app.resetTick = 0;
     PushLog(L"启动失败：" + why);
@@ -1003,7 +1062,8 @@ static bool RunLaunchStep(int step) {
             AbortLaunch(L"未检测到 Java，请安装 JRE/JDK 或设置 JAVA_HOME");
             return false;
         }
-        PushLog(L"离线账户 · " + g_app.username);
+        const bool msa = (g_ms.state == MS_LOGGED_IN && !g_ms.accessToken.empty());
+        PushLog((msa ? L"微软账户 · " : L"离线账户 · ") + (msa ? g_ms.name : g_offlineName));
         return true;
     }
     case 1: {
@@ -1068,7 +1128,11 @@ static bool RunLaunchStep(int step) {
 
 static void StartLaunch() {
     if (g_app.launching) return;
-    if (g_app.username.empty()) {
+    if (g_ms.state == MS_WAITING || g_ms.state == MS_WORKING) {
+        PushLog(L"微软账号正在登录，请稍候；或点「离线登录」先用离线模式");
+        return;
+    }
+    if (g_ms.state != MS_LOGGED_IN && g_offlineName.empty()) {
         PushLog(L"请先填写玩家昵称");
         g_app.focus = FOCUS_USER;
         return;
@@ -1078,12 +1142,15 @@ static void StartLaunch() {
     g_app.launching = true;
     g_app.launched  = false;
     g_app.progress  = 0.0f;
+    g_app.progressTarget = 0.0f;
     g_app.step      = 0;
     g_app.resetTick = 0;
     for (int i = 0; i < kLaunchStepCount; ++i) g_app.stepRan[i] = false;
     g_app.logs.clear();
     g_plan = LaunchPlan();
     PushLog(kLaunchSteps[0]);
+    // 16ms 一帧单独跑进度条动画，避免跟着 100ms 的业务定时器一顿一顿地跳
+    if (g_app.hwnd) SetTimer(g_app.hwnd, 4, 16, nullptr);
 }
 
 static void FinishLaunch() {
@@ -1099,6 +1166,585 @@ static void FinishLaunch() {
         g_app.resetTick = 0;
     }
     SaveConfig();
+}
+
+// 启动状态机一步：跑当前步骤的真实工作，或在进度动画跑满后推进下一步。
+// 由 100ms 业务定时器和 16ms 动画定时器共同驱动，靠 stepRan 幂等，不会重复执行。
+// 返回 true 表示状态/日志有变化，需要整窗重绘。
+static bool LaunchTick() {
+    if (!g_app.launching) return false;
+    const int step = g_app.step;
+    if (!g_app.stepRan[step]) {
+        if (!RunLaunchStep(step)) return true;   // 失败时 AbortLaunch 已重置状态
+        g_app.stepRan[step] = true;
+        g_app.progressTarget = (float)(step + 1) * 20.0f;
+        return false;
+    }
+    if (g_app.progress < g_app.progressTarget - 0.001f) return false;
+    if (step + 1 >= kLaunchStepCount) {
+        FinishLaunch();
+    } else {
+        g_app.step = step + 1;
+        PushLog(kLaunchSteps[step + 1]);
+    }
+    return true;
+}
+
+// ============================================================================
+//  微软账号
+//  ---------------------------------------------------------------------------
+//  流程：设备码授权 → Xbox Live 认证 → XSTS 授权 → Minecraft Services 登录 → 取档案
+//  选设备码而不是内嵌浏览器：不需要 localhost 回调、不需要 WebView2，
+//  单个 exe 也能跑完；用户只需在浏览器里输一次 8 位码。
+// ============================================================================
+static const wchar_t* kMsClientId = L"00000000402b5328";
+static const wchar_t* kMsScope    = L"XboxLive.signin offline_access";
+
+// ---- 小工具：URL 编码 / JSON 转义 / Base64 ----
+static std::string UrlEnc(const std::string& u) {
+    static const char* hx = "0123456789ABCDEF";
+    std::string o;
+    o.reserve(u.size() * 3);
+    for (size_t i = 0; i < u.size(); ++i) {
+        unsigned char c = (unsigned char)u[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            o.push_back((char)c);
+        } else {
+            o.push_back('%');
+            o.push_back(hx[c >> 4]);
+            o.push_back(hx[c & 0x0F]);
+        }
+    }
+    return o;
+}
+
+static std::string JsonEsc(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '"' || c == '\\') { o.push_back('\\'); o.push_back(c); }
+        else if ((unsigned char)c < 0x20) { char b[8]; sprintf(b, "\\u%04x", c); o += b; }
+        else o.push_back(c);
+    }
+    return o;
+}
+
+static std::string B64Enc(const std::vector<BYTE>& in) {
+    static const char* tb =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o;
+    size_t i = 0;
+    while (i + 2 < in.size()) {
+        unsigned v = ((unsigned)in[i] << 16) | ((unsigned)in[i + 1] << 8) | in[i + 2];
+        o.push_back(tb[(v >> 18) & 63]); o.push_back(tb[(v >> 12) & 63]);
+        o.push_back(tb[(v >> 6) & 63]);  o.push_back(tb[v & 63]);
+        i += 3;
+    }
+    if (i + 1 == in.size()) {
+        unsigned v = (unsigned)in[i] << 16;
+        o.push_back(tb[(v >> 18) & 63]); o.push_back(tb[(v >> 12) & 63]);
+        o += "==";
+    } else if (i + 2 == in.size()) {
+        unsigned v = ((unsigned)in[i] << 16) | ((unsigned)in[i + 1] << 8);
+        o.push_back(tb[(v >> 18) & 63]); o.push_back(tb[(v >> 12) & 63]);
+        o.push_back(tb[(v >> 6) & 63]);  o.push_back('=');
+    }
+    return o;
+}
+
+static std::vector<BYTE> B64Dec(const std::string& s) {
+    std::vector<BYTE> o;
+    int val = 0, bits = -8;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        int d;
+        if (c >= 'A' && c <= 'Z')      d = c - 'A';
+        else if (c >= 'a' && c <= 'z') d = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') d = c - '0' + 52;
+        else if (c == '+')             d = 62;
+        else if (c == '/')             d = 63;
+        else continue;
+        val = (val << 6) | d;
+        bits += 6;
+        if (bits >= 0) { o.push_back((BYTE)((val >> bits) & 0xFF)); bits -= 8; }
+    }
+    return o;
+}
+
+// ---- HTTPS（WinHTTP） ----
+struct HttpResp { int status = 0; std::string body; std::wstring err; };
+
+static HttpResp HttpCall(const std::wstring& verb, const std::wstring& url,
+                         const std::string& body, const std::wstring& contentType,
+                         const std::wstring& bearer) {
+    HttpResp r;
+
+    URL_COMPONENTS uc;
+    ZeroMemory(&uc, sizeof(uc));
+    uc.dwStructSize = sizeof(uc);
+    wchar_t host[256]  = {0};
+    wchar_t path[2048] = {0};
+    uc.lpszHostName      = host; uc.dwHostNameLength = 255;
+    uc.lpszUrlPath       = path; uc.dwUrlPathLength  = 2047;
+    if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc)) {
+        r.err = L"URL 解析失败";
+        return r;
+    }
+    const bool secure = (uc.nScheme == INTERNET_SCHEME_HTTPS);
+
+    HINTERNET ses = WinHttpOpen(L"DreamMinecraftLauncher/0.2",
+                                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) { r.err = L"初始化网络失败"; return r; }
+    WinHttpSetTimeouts(ses, 15000, 15000, 30000, 30000);
+
+    HINTERNET con = nullptr, req = nullptr;
+    do {
+        con = WinHttpConnect(ses, host, uc.nPort, 0);
+        if (!con) { r.err = L"无法连接 " + std::wstring(host); break; }
+
+        req = WinHttpOpenRequest(con, verb.c_str(), path, nullptr, WINHTTP_NO_REFERER,
+                                 WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                 secure ? WINHTTP_FLAG_SECURE : 0);
+        if (!req) { r.err = L"创建请求失败"; break; }
+
+        std::wstring hdr;
+        if (!contentType.empty()) hdr += L"Content-Type: " + contentType + L"\r\n";
+        if (!bearer.empty())      hdr += L"Authorization: Bearer " + bearer + L"\r\n";
+        hdr += L"Accept: application/json\r\n";
+
+        if (!WinHttpSendRequest(req, hdr.c_str(), (DWORD)-1L,
+                                body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.data(),
+                                (DWORD)body.size(), (DWORD)body.size(), 0)) {
+            r.err = L"发送请求失败（" + std::to_wstring(GetLastError()) + L"）";
+            break;
+        }
+        if (!WinHttpReceiveResponse(req, nullptr)) {
+            r.err = L"接收响应失败（" + std::to_wstring(GetLastError()) + L"）";
+            break;
+        }
+
+        DWORD st = 0, stLen = sizeof(st);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &st, &stLen, WINHTTP_NO_HEADER_INDEX);
+        r.status = (int)st;
+
+        for (;;) {
+            DWORD avail = 0;
+            if (!WinHttpQueryDataAvailable(req, &avail) || avail == 0) break;
+            std::string chunk;
+            chunk.resize(avail);
+            DWORD got = 0;
+            if (!WinHttpReadData(req, &chunk[0], avail, &got) || got == 0) break;
+            chunk.resize(got);
+            r.body += chunk;
+            if (r.body.size() > (4u << 20)) break;      // 防御：响应不会这么大
+        }
+    } while (0);
+
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    WinHttpCloseHandle(ses);
+    return r;
+}
+
+// ---- refresh token 加密落盘（DPAPI，只能本机本用户解开） ----
+static std::wstring AccountPath() { return AppDataConfigDir() + L"\\account.dat"; }
+
+static bool DpapiProtect(const std::wstring& plain, std::vector<BYTE>& out) {
+    std::string u8 = W2U8(plain);
+    DATA_BLOB in;
+    in.pbData = (BYTE*)u8.data();
+    in.cbData = (DWORD)u8.size();
+    DATA_BLOB enc;
+    ZeroMemory(&enc, sizeof(enc));
+    if (!CryptProtectData(&in, L"DML refresh token", nullptr, nullptr, nullptr,
+                          CRYPTPROTECT_UI_FORBIDDEN, &enc)) return false;
+    out.assign(enc.pbData, enc.pbData + enc.cbData);
+    LocalFree(enc.pbData);
+    return true;
+}
+
+static bool DpapiUnprotect(const std::vector<BYTE>& in, std::wstring& plain) {
+    if (in.empty()) return false;
+    DATA_BLOB src;
+    src.pbData = (BYTE*)in.data();
+    src.cbData = (DWORD)in.size();
+    DATA_BLOB dec;
+    ZeroMemory(&dec, sizeof(dec));
+    if (!CryptUnprotectData(&src, nullptr, nullptr, nullptr, nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN, &dec)) return false;
+    std::string u8((char*)dec.pbData, dec.cbData);
+    LocalFree(dec.pbData);
+    plain = U82W(u8);
+    return true;
+}
+
+static void SaveAccount(const std::wstring& refresh, const std::wstring& name,
+                        const std::wstring& uuid, const std::wstring& xuid) {
+    std::vector<BYTE> blob;
+    if (!DpapiProtect(refresh, blob)) return;
+    CreateDirectoryW(AppDataConfigDir().c_str(), nullptr);
+    std::ofstream f(W2U8(AccountPath()).c_str(), std::ios::binary);
+    if (!f) return;
+    f << "v1\n" << W2U8(name) << "\n" << W2U8(uuid) << "\n" << W2U8(xuid) << "\n"
+      << B64Enc(blob) << "\n";
+}
+
+static bool LoadAccount(std::wstring& refresh, std::wstring& name,
+                        std::wstring& uuid, std::wstring& xuid) {
+    std::ifstream f(W2U8(AccountPath()).c_str(), std::ios::binary);
+    if (!f) return false;
+    std::vector<std::string> ln;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        ln.push_back(line);
+    }
+    if (ln.size() < 5 || ln[0] != "v1") return false;
+    name = U82W(ln[1]);
+    uuid = U82W(ln[2]);
+    xuid = U82W(ln[3]);
+    std::vector<BYTE> blob = B64Dec(ln[4]);
+    return DpapiUnprotect(blob, refresh) && !refresh.empty();
+}
+
+static void ClearAccountFile() { DeleteFileW(AccountPath().c_str()); }
+
+// ---- 各段接口 ----
+static bool MsDeviceCode(std::wstring& userCode, std::wstring& uri,
+                         std::wstring& deviceCode, int& interval, std::wstring& err) {
+    const std::string body = "client_id=" + UrlEnc(W2U8(kMsClientId)) +
+                             "&scope=" + UrlEnc(W2U8(kMsScope)) +
+                             "&response_type=device_code";
+    HttpResp r = HttpCall(L"POST", L"https://login.live.com/oauth20_connect.srf",
+                          body, L"application/x-www-form-urlencoded", L"");
+    if (r.status != 200) {
+        err = L"申请登录码失败（HTTP " + std::to_wstring(r.status) + L"）" +
+              (r.err.empty() ? L"" : L"：" + r.err);
+        return false;
+    }
+    JVal j;
+    if (!ParseJsonUtf8(r.body, j)) { err = L"登录码响应无法解析"; return false; }
+
+    userCode   = j.str(L"user_code");
+    uri        = j.str(L"verification_uri");
+    deviceCode = j.str(L"device_code");
+    const JVal* iv = j.get(L"interval");
+    interval = (iv && iv->t == JVal::NUM && iv->num >= 1.0) ? (int)iv->num : 5;
+    if (uri.empty()) uri = L"https://www.microsoft.com/link";
+    if (userCode.empty() || deviceCode.empty()) { err = L"登录码响应字段缺失"; return false; }
+    return true;
+}
+
+// 1 = 成功 / 0 = 等待 / -3 = 需要放慢 / -2 = 失败
+static int MsPollToken(const std::wstring& deviceCode, std::wstring& refresh,
+                       std::wstring& msToken, std::wstring& err) {
+    const std::string body = "client_id=" + UrlEnc(W2U8(kMsClientId)) +
+                             "&device_code=" + UrlEnc(W2U8(deviceCode)) +
+                             "&grant_type=" +
+                             UrlEnc("urn:ietf:params:oauth:grant-type:device_code");
+    HttpResp r = HttpCall(L"POST", L"https://login.live.com/oauth20_token.srf",
+                          body, L"application/x-www-form-urlencoded", L"");
+    JVal j;
+    const bool parsed = ParseJsonUtf8(r.body, j);
+    if (r.status == 200 && parsed) {
+        refresh = j.str(L"refresh_token");
+        msToken = j.str(L"access_token");
+        if (refresh.empty()) { err = L"令牌响应缺少 refresh_token"; return -2; }
+        return 1;
+    }
+    const std::wstring e = parsed ? j.str(L"error") : L"";
+    if (e == L"authorization_pending")  return 0;
+    if (e == L"slow_down")              return -3;
+    if (e == L"expired_token")          { err = L"登录码已过期，请重新点击登录"; return -2; }
+    if (e == L"authorization_declined") { err = L"浏览器里取消了授权"; return -2; }
+    err = L"获取令牌失败（HTTP " + std::to_wstring(r.status) + L"）" +
+          (e.empty() ? L"" : L"：" + e);
+    return -2;
+}
+
+static bool MsRefreshGrant(const std::wstring& refreshIn, std::wstring& msToken,
+                           std::wstring& refreshOut, std::wstring& err) {
+    const std::string body = "client_id=" + UrlEnc(W2U8(kMsClientId)) +
+                             "&refresh_token=" + UrlEnc(W2U8(refreshIn)) +
+                             "&grant_type=refresh_token&scope=" + UrlEnc(W2U8(kMsScope));
+    HttpResp r = HttpCall(L"POST", L"https://login.live.com/oauth20_token.srf",
+                          body, L"application/x-www-form-urlencoded", L"");
+    if (r.status != 200) {
+        err = L"刷新登录态失败（HTTP " + std::to_wstring(r.status) + L"）";
+        return false;
+    }
+    JVal j;
+    if (!ParseJsonUtf8(r.body, j)) { err = L"刷新响应无法解析"; return false; }
+    msToken    = j.str(L"access_token");
+    refreshOut = j.str(L"refresh_token");
+    if (refreshOut.empty()) refreshOut = refreshIn;
+    if (msToken.empty()) { err = L"刷新响应缺少 access_token"; return false; }
+    return true;
+}
+
+static bool MsXblAuth(const std::wstring& msToken, std::wstring& xbl,
+                      std::wstring& uhs, std::wstring& err) {
+    const std::string json =
+        "{\"Properties\":{\"AuthMethod\":\"RPS\","
+        "\"SiteName\":\"user.auth.xboxlive.com\","
+        "\"RpsTicket\":\"d=" + JsonEsc(W2U8(msToken)) + "\"},"
+        "\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\"}";
+    HttpResp r = HttpCall(L"POST", L"https://user.auth.xboxlive.com/user/authenticate",
+                          json, L"application/json", L"");
+    if (r.status != 200) {
+        err = L"Xbox Live 认证失败（HTTP " + std::to_wstring(r.status) + L"）";
+        return false;
+    }
+    JVal j;
+    if (!ParseJsonUtf8(r.body, j)) { err = L"XBL 响应无法解析"; return false; }
+    xbl = j.str(L"Token");
+    const JVal* dc  = j.get(L"DisplayClaims");
+    const JVal* xui = dc ? dc->get(L"xui") : nullptr;
+    if (xui && xui->t == JVal::ARR && !xui->a.empty()) uhs = xui->a[0].str(L"uhs");
+    if (xbl.empty() || uhs.empty()) { err = L"XBL 响应缺少 Token / uhs"; return false; }
+    return true;
+}
+
+static bool MsXsts(const std::wstring& xbl, std::wstring& xsts, std::wstring& uhs,
+                   std::wstring& xuid, std::wstring& err) {
+    const std::string json =
+        "{\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"" +
+        JsonEsc(W2U8(xbl)) + "\"]},"
+        "\"RelyingParty\":\"rp://api.minecraftservices.com/\",\"TokenType\":\"JWT\"}";
+    HttpResp r = HttpCall(L"POST", L"https://xsts.auth.xboxlive.com/xsts/authorize",
+                          json, L"application/json", L"");
+    if (r.status != 200) {
+        JVal j;
+        if (ParseJsonUtf8(r.body, j)) {
+            const JVal* xe = j.get(L"XErr");
+            const unsigned long long code =
+                (xe && xe->t == JVal::NUM) ? (unsigned long long)xe->num : 0ULL;
+            if (code == 2148916233ULL) {
+                err = L"该微软账号还没有 Xbox 档案，请先到 xbox.com 建一个";
+                return false;
+            }
+            if (code == 2148916235ULL) { err = L"该账号所在地区不支持 Xbox Live"; return false; }
+            if (code == 2148916238ULL) { err = L"未成年账号需要先加入家庭组"; return false; }
+        }
+        err = L"XSTS 授权失败（HTTP " + std::to_wstring(r.status) + L"）";
+        return false;
+    }
+    JVal j;
+    if (!ParseJsonUtf8(r.body, j)) { err = L"XSTS 响应无法解析"; return false; }
+    xsts = j.str(L"Token");
+    const JVal* dc  = j.get(L"DisplayClaims");
+    const JVal* xui = dc ? dc->get(L"xui") : nullptr;
+    if (xui && xui->t == JVal::ARR && !xui->a.empty()) {
+        uhs  = xui->a[0].str(L"uhs");
+        xuid = xui->a[0].str(L"xid");
+    }
+    if (xsts.empty() || uhs.empty()) { err = L"XSTS 响应缺少 Token / uhs"; return false; }
+    return true;
+}
+
+static bool MsMcLogin(const std::wstring& xsts, const std::wstring& uhs,
+                      std::wstring& mcToken, std::wstring& err) {
+    const std::string json = "{\"identityToken\":\"XBL3.0 x=" + JsonEsc(W2U8(uhs)) +
+                             ";" + JsonEsc(W2U8(xsts)) + "\"}";
+    HttpResp r = HttpCall(L"POST",
+                          L"https://api.minecraftservices.com/authentication/login_with_xbox",
+                          json, L"application/json", L"");
+    if (r.status != 200) {
+        err = L"Minecraft 登录失败（HTTP " + std::to_wstring(r.status) + L"）";
+        return false;
+    }
+    JVal j;
+    if (!ParseJsonUtf8(r.body, j)) { err = L"Minecraft 登录响应无法解析"; return false; }
+    mcToken = j.str(L"access_token");
+    if (mcToken.empty()) { err = L"Minecraft 登录响应缺少 access_token"; return false; }
+    return true;
+}
+
+static bool MsProfile(const std::wstring& mcToken, std::wstring& name,
+                      std::wstring& uuid, std::wstring& err) {
+    HttpResp r = HttpCall(L"GET", L"https://api.minecraftservices.com/minecraft/profile",
+                          std::string(), L"", mcToken);
+    if (r.status == 404) {
+        err = L"这个账号没有 Minecraft: Java Edition";
+        return false;
+    }
+    if (r.status != 200) {
+        err = L"读取游戏档案失败（HTTP " + std::to_wstring(r.status) + L"）";
+        return false;
+    }
+    JVal j;
+    if (!ParseJsonUtf8(r.body, j)) { err = L"档案响应无法解析"; return false; }
+    name = j.str(L"name");
+    uuid = j.str(L"id");
+    // MC 命令行要的是不带横线的 uuid
+    std::wstring plain;
+    for (size_t i = 0; i < uuid.size(); ++i) if (uuid[i] != L'-') plain.push_back(uuid[i]);
+    uuid = plain;
+    if (name.empty() || uuid.empty()) { err = L"档案响应缺少 name / id"; return false; }
+    return true;
+}
+
+// ---- 线程之间传结果 ----
+static CRITICAL_SECTION g_msLock;
+static bool g_msLockReady = false;
+
+struct MsShared {
+    bool ok = false;
+    bool silent = false;
+    std::wstring err, name, uuid, xuid, mcToken, refresh, userCode, uri;
+};
+static MsShared g_msShared;
+
+static void InitMsLock() {
+    if (g_msLockReady) return;
+    InitializeCriticalSection(&g_msLock);
+    g_msLockReady = true;
+}
+
+static void PublishMs(const MsShared& s) {
+    EnterCriticalSection(&g_msLock);
+    g_msShared = s;
+    LeaveCriticalSection(&g_msLock);
+    if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_APP_MS, 2, 0);
+}
+
+static void MsThreadLog(const std::wstring& s) {
+    if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_APP_LOG, 0, (LPARAM)new std::wstring(s));
+}
+
+// XBL → XSTS → Minecraft 登录 → 档案，一条链跑完
+static bool MsChain(const std::wstring& msToken, MsShared& out, std::wstring& err) {
+    std::wstring xbl, uhs, xsts, xuid, mc, name, uuid;
+    if (!MsXblAuth(msToken, xbl, uhs, err))       return false;
+    if (!MsXsts(xbl, xsts, uhs, xuid, err))       return false;
+    if (!MsMcLogin(xsts, uhs, mc, err))           return false;
+    if (!MsProfile(mc, name, uuid, err))          return false;
+    out.ok = true;
+    out.mcToken = mc;
+    out.name = name;
+    out.uuid = uuid;
+    out.xuid = xuid;
+    return true;
+}
+
+static DWORD WINAPI MsLoginThread(LPVOID) {
+    MsShared sh;
+    std::wstring err;
+
+    std::wstring userCode, uri, deviceCode;
+    int interval = 5;
+    if (!MsDeviceCode(userCode, uri, deviceCode, interval, err)) {
+        sh.err = err;
+        PublishMs(sh);
+        return 0;
+    }
+
+    EnterCriticalSection(&g_msLock);
+    g_msShared.userCode = userCode;
+    g_msShared.uri      = uri;
+    LeaveCriticalSection(&g_msLock);
+    if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_APP_MS, 1, 0);
+
+    std::wstring refresh, msToken;
+    const DWORD began = GetTickCount();
+    bool got = false;
+    for (;;) {
+        Sleep((DWORD)interval * 1000);
+        if (GetTickCount() - began > 15UL * 60UL * 1000UL) { err = L"等待授权超时"; break; }
+        int rc = MsPollToken(deviceCode, refresh, msToken, err);
+        if (rc == 1)  { got = true; break; }
+        if (rc == -3) { interval += 2; continue; }
+        if (rc == -2) break;
+    }
+    if (!got) {
+        sh.err = err.empty() ? L"未拿到授权" : err;
+        PublishMs(sh);
+        return 0;
+    }
+
+    MsThreadLog(L"授权成功，正在换取游戏令牌 …");
+    if (!MsChain(msToken, sh, err)) {
+        sh.ok = false;
+        sh.err = err;
+        PublishMs(sh);
+        return 0;
+    }
+    sh.refresh = refresh;
+    SaveAccount(refresh, sh.name, sh.uuid, sh.xuid);
+    PublishMs(sh);
+    return 0;
+}
+
+// 启动时静默续期：用落盘的 refresh token 重新走一遍链
+static DWORD WINAPI MsRefreshThread(LPVOID) {
+    MsShared sh;
+    sh.silent = true;
+    std::wstring err;
+
+    std::wstring refresh, name, uuid, xuid;
+    if (!LoadAccount(refresh, name, uuid, xuid)) {
+        sh.err = L"没有已保存的账号";
+        PublishMs(sh);
+        return 0;
+    }
+
+    std::wstring msToken, newRefresh;
+    if (!MsRefreshGrant(refresh, msToken, newRefresh, err) ||
+        !MsChain(msToken, sh, err)) {
+        sh.ok = false;
+        sh.silent = true;
+        sh.err = err;
+        PublishMs(sh);
+        return 0;
+    }
+    sh.refresh = newRefresh;
+    SaveAccount(newRefresh, sh.name, sh.uuid, sh.xuid);
+    PublishMs(sh);
+    return 0;
+}
+
+static void StartMsLogin() {
+    if (g_ms.state == MS_WAITING || g_ms.state == MS_WORKING) return;
+    InitMsLock();
+    g_ms.err.clear();
+    g_ms.userCode.clear();
+    g_ms.verifyUri.clear();
+    g_ms.state = MS_WAITING;
+    if (g_app.hwnd) KillTimer(g_app.hwnd, 3);     // 上一轮的自动开浏览器倒计时作废
+    g_app.dlgWait = 0;
+    PushLog(L"正在申请微软登录码 …");
+    HANDLE h = CreateThread(nullptr, 0, MsLoginThread, nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+static void LogoutMs() {
+    ClearAccountFile();
+    g_ms = MsAccount();
+    if (g_app.hwnd) KillTimer(g_app.hwnd, 3);
+    g_app.dlgWait  = 0;
+    g_app.username = g_offlineName;
+    g_app.focus    = FOCUS_NONE;
+    PushLog(L"已退出微软账号，回到离线模式");
+    SaveConfig();
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+static void MsAutoRefresh() {
+    std::wstring refresh, name, uuid, xuid;
+    if (!LoadAccount(refresh, name, uuid, xuid)) return;
+    InitMsLock();
+    g_ms.state      = MS_WORKING;
+    g_ms.name       = name;
+    g_ms.uuid       = uuid;
+    g_ms.refreshToken = refresh;
+    g_app.username  = name;
+    HANDLE h = CreateThread(nullptr, 0, MsRefreshThread, nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
 }
 
 // ============================================================================
@@ -1200,12 +1846,102 @@ static void DrawLogo(Graphics& gr, const RectF& r) {
         gr.DrawLine(&grid, r.X, y, r.X + r.Width, y);
     }
     gr.ResetClip();
-    StrokeRound(gr, r, SR(11), Color(40, 255, 255, 255), SR(1));
+    StrokeRound(gr, r, SR(11), Color(36, 0, 0, 0), SR(1));
 }
 
 static void DrawFieldBox(Graphics& gr, const RectF& r, bool focused) {
     FillRound(gr, r, SR(10), C(Theme::Field));
     StrokeRound(gr, r, SR(10), C(focused ? Theme::AccentSoft : Theme::Border), SR(focused ? 1.4f : 1.0f));
+}
+
+// 账号方式选项：昵称框下方并排两个小胶囊，默认选中「离线登录」
+// 选中态用浅蓝底 + 蓝字，未选中是极浅的灰底
+static void DrawAuthPill(Graphics& gr, const RectF& r, const std::wstring& text,
+                         bool active, bool hover) {
+    FillRound(gr, r, SR(11),
+              active ? C(Theme::PillBg) : C(hover ? Theme::FieldHover : Theme::Field));
+    StrokeRound(gr, r, SR(11), C(active ? Theme::PillBorder : Theme::Border),
+                SR(active ? 1.3f : 1.0f));
+    DrawStr(gr, text, r, *F.sub,
+            C(active ? Theme::PillText : (hover ? Theme::Text : Theme::Muted)),
+            StringAlignmentCenter);
+}
+
+static void DrawAuthRow(Graphics& gr, const Layout& L) {
+    const bool busy   = (g_ms.state == MS_WAITING || g_ms.state == MS_WORKING);
+    const bool msMode = (g_ms.state != MS_LOGGED_OUT);
+
+    DrawAuthPill(gr, L.msOffBtn, L"离线登录", !msMode, g_app.hover == HIT_MS_OFF);
+    DrawAuthPill(gr, L.msOnBtn,
+                 g_ms.state == MS_WAITING ? L"授权中…"
+                 : (g_ms.state == MS_WORKING ? L"登录中…" : L"微软登录"),
+                 msMode, g_app.hover == HIT_MS_ON);
+
+    if (g_ms.state == MS_LOGGED_IN)
+        DrawStr(gr, L"解除绑定", L.msUnbind, *F.sub, C(Theme::PillText),
+                StringAlignmentNear, true);
+    else if (busy)
+        DrawStr(gr, L"去浏览器输码", L.msUnbind, *F.sub, C(Theme::PillText),
+                StringAlignmentNear, true);
+}
+
+// 验证码弹窗：告诉用户码已复制，并给出继续去浏览器验证的入口
+// a = 动画进度（0 收起 / 1 完全展开）：遮罩淡入 + 卡片从下方 14px 滑入
+static void DrawMsDialog(Graphics& gr, const Layout& L, int W, int H, float a) {
+    const float e  = 1.0f - (1.0f - a) * (1.0f - a) * (1.0f - a);   // ease-out
+    const BYTE  ca = (BYTE)(255.0f * e);
+
+    SolidBrush scrim(Color((BYTE)(104.0f * e), 18, 26, 40));
+    gr.FillRectangle(&scrim, 0, 0, W, H);
+
+    const REAL dy = (1.0f - e) * SR(14);
+    RectF card = L.dlgCard;
+    card.Y += dy;
+
+    FillRound(gr, card, SR(16), C(Theme::Panel, ca));
+    StrokeRound(gr, card, SR(16), C(Theme::PanelBorder, ca), SR(1));
+
+    const REAL x = card.X, w = card.Width;
+
+    DrawStr(gr, L"微软账号登录", RectF(x, card.Y + S(18), w, S(22)),
+            *F.title, C(Theme::Text, ca), StringAlignmentCenter);
+    DrawStr(gr, L"验证码已复制到剪贴板", RectF(x, card.Y + S(46), w, S(18)),
+            *F.sub, C(Theme::Muted, ca), StringAlignmentCenter);
+
+    // 大号验证码
+    DrawStr(gr, g_ms.userCode.empty() ? L"…" : g_ms.userCode,
+            RectF(x, card.Y + S(70), w, S(34)), *F.title, C(Theme::Accent, ca),
+            StringAlignmentCenter);
+
+    // 浏览器唤起前带倒计时，唤起后换成「已打开」
+    const std::wstring tip = g_app.dlgWait > 0
+        ? (L"浏览器将在 " + std::to_wstring(g_app.dlgWait) + L" 秒后自动打开")
+        : std::wstring(L"浏览器已打开 microsoft.com/link");
+    DrawStr(gr, tip, RectF(x, card.Y + S(110), w, S(16)),
+            *F.sub, C(Theme::Muted, ca), StringAlignmentCenter);
+    DrawStr(gr, L"粘贴验证码并完成登录，窗口会自动刷新",
+            RectF(x, card.Y + S(128), w, S(16)),
+            *F.sub, C(Theme::Dim, ca), StringAlignmentCenter);
+
+    const REAL bdy = dy;
+    RectF openBtn = L.dlgOpen; openBtn.Y += bdy;
+    RectF okBtn   = L.dlgOk;   okBtn.Y   += bdy;
+
+    FillRound(gr, openBtn, SR(9), C(Theme::PillText, ca));
+    DrawStr(gr, L"重新打开浏览器", openBtn, *F.sub, C(Theme::OnAccent, ca),
+            StringAlignmentCenter);
+
+    FillRound(gr, okBtn, SR(9), C(Theme::Field, ca));
+    StrokeRound(gr, okBtn, SR(9), C(Theme::Border, ca), SR(1));
+    DrawStr(gr, L"知道了", okBtn, *F.sub, C(Theme::Muted, ca), StringAlignmentCenter);
+}
+
+// 打开 / 收起弹窗：起一个 15ms 的动画定时器，跑完自动停
+static void AnimMsDialog(bool open) {
+    g_app.msDlg = open;
+    if (open && g_app.msAnim <= 0.001f) g_app.msAnim = 0.0f;
+    if (g_app.hwnd) SetTimer(g_app.hwnd, 2, 15, nullptr);
+    if (g_app.hwnd) InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
 static void Paint(HWND hwnd) {
@@ -1226,6 +1962,11 @@ static void Paint(HWND hwnd) {
         gr.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
         gr.SetPixelOffsetMode(PixelOffsetModeHalf);
         gr.Clear(C(Theme::Bg));
+        {
+            // 无边框窗口：客户区外圈描一条极淡的分界线，避免白底与浅色桌面糊在一起
+            Pen edge(C(Theme::Border), SR(1));
+            gr.DrawRectangle(&edge, 0, 0, (INT)W - 1, (INT)H - 1);
+        }
 
         Layout L = ComputeLayout();
 
@@ -1248,7 +1989,7 @@ static void Paint(HWND hwnd) {
         {
             RectF tr(L.userBox.X + SR(14), L.userBox.Y, L.userBox.Width - SR(28), L.userBox.Height);
             DrawStr(gr, g_app.username, tr, *F.input, C(Theme::Text), StringAlignmentNear, false, true);
-            if (g_app.focus == FOCUS_USER && g_app.caretOn) {
+            if (g_app.focus == FOCUS_USER && g_app.caretOn && g_ms.state != MS_LOGGED_IN) {
                 REAL w  = MeasureW(gr, g_app.username, *F.input);
                 REAL cx = tr.X + w + SR(1);
                 REAL cy = L.userBox.Y + L.userBox.Height / 2;
@@ -1256,6 +1997,9 @@ static void Paint(HWND hwnd) {
                 gr.DrawLine(&caretp, cx, cy - SR(9), cx, cy + SR(9));
             }
         }
+
+        // 账号方式：离线登录 / 微软登录（默认离线）
+        DrawAuthRow(gr, L);
 
         // 版本下拉框
         DrawFieldBox(gr, L.verBox, g_app.ddOpen);
@@ -1275,8 +2019,8 @@ static void Paint(HWND hwnd) {
         }
 
         // 内存滑块
-        DrawStr(gr, L"内存分配", RectF(S(54), S(178), S(240), S(18)), *F.label, C(Theme::Muted));
-        DrawStr(gr, std::to_wstring(g_app.memGb) + L" GB", RectF(S(52), S(176), S(656), S(20)),
+        DrawStr(gr, L"内存分配", RectF(S(54), S(200), S(240), S(18)), *F.label, C(Theme::Muted));
+        DrawStr(gr, std::to_wstring(g_app.memGb) + L" GB", RectF(S(52), S(198), S(656), S(20)),
                 *F.value, C(Theme::Accent), StringAlignmentFar);
 
         FillRound(gr, L.sliderTrack, SR(3), C(Theme::Track));
@@ -1316,18 +2060,18 @@ static void Paint(HWND hwnd) {
         {
             RectF b = L.launchBtn;
             if (g_app.launching) {
-                FillRound(gr, b, SR(13), C(RGB(0x1E, 0x24, 0x22)));
+                FillRound(gr, b, SR(13), C(RGB(0xE8, 0xF2, 0xEC)));
                 GraphicsPath pth;
                 AddRoundRect(pth, b, SR(13));
                 gr.SetClip(&pth);
                 REAL w = b.Width * (g_app.progress / 100.0f);
-                if (w > SR(4)) FillRound(gr, RectF(b.X, b.Y, w, b.Height), SR(13), C(Theme::AccentSoft));
+                if (w > SR(4)) FillRound(gr, RectF(b.X, b.Y, w, b.Height), SR(13), C(RGB(0x3F, 0xBF, 0x7C)));
                 gr.ResetClip();
-                StrokeRound(gr, b, SR(13), Color(70, 120, 220, 160), SR(1));
+                StrokeRound(gr, b, SR(13), Color(90, 36, 168, 98), SR(1));
             } else {
-                DWORD base = g_app.launched ? RGB(0x36, 0xA8, 0x66)
-                            : (g_app.hover == HIT_LAUNCH ? RGB(0x5C, 0xEB, 0x90) : Theme::Accent);
-                DWORD base2 = g_app.launched ? RGB(0x2A, 0x8C, 0x52) : RGB(0x3E, 0xC9, 0x71);
+                DWORD base  = g_app.launched ? RGB(0x2E, 0x9E, 0x62)
+                            : (g_app.hover == HIT_LAUNCH ? RGB(0x3F, 0xCC, 0x80) : RGB(0x2F, 0xB8, 0x6C));
+                DWORD base2 = g_app.launched ? RGB(0x1D, 0x84, 0x4E) : RGB(0x24, 0x9E, 0x5A);
                 LinearGradientBrush lg(b, C(base), C(base2), LinearGradientModeVertical);
                 GraphicsPath pth;
                 AddRoundRect(pth, b, SR(13));
@@ -1337,7 +2081,7 @@ static void Paint(HWND hwnd) {
             std::wstring text = g_app.launching
                 ? (L"正在启动 " + std::to_wstring((int)g_app.progress) + L"%")
                 : (g_app.launched ? L"游戏已启动" : L"启动游戏");
-            Color tc = g_app.launching ? Color(255, 240, 255, 246) : C(Theme::OnAccent);
+            Color tc = g_app.launching ? C(Theme::Text) : C(Theme::OnAccent);
 
             REAL tw    = MeasureW(gr, text, *F.btn);
             REAL iconW = g_app.launching ? 0.0f : SR(23);
@@ -1373,8 +2117,8 @@ static void Paint(HWND hwnd) {
             int show = std::min(n, DD_MAX_SHOW);
             RectF panel(L.verBox.X, L.verBox.Y + L.verBox.Height + SR(6), L.verBox.Width,
                         (REAL)(show * S(DD_ITEM_H) + S(8)));
-            FillRound(gr, panel, SR(11), C(RGB(0x1E, 0x22, 0x29)));
-            StrokeRound(gr, panel, SR(11), C(RGB(0x35, 0x3B, 0x45)), SR(1));
+            FillRound(gr, panel, SR(11), C(RGB(0xFF, 0xFF, 0xFF)));
+            StrokeRound(gr, panel, SR(11), C(RGB(0xDC, 0xE2, 0xEC)), SR(1));
 
             GraphicsPath clip;
             AddRoundRect(clip, panel, SR(11));
@@ -1386,7 +2130,7 @@ static void Paint(HWND hwnd) {
                          panel.Width - SR(10), S(DD_ITEM_H));
                 bool sel = (idx == g_app.versionIdx);
                 if (g_app.ddHover == idx || sel)
-                    FillRound(gr, ir, SR(8), C(sel ? RGB(0x25, 0x33, 0x2B) : Theme::FieldHover));
+                    FillRound(gr, ir, SR(8), C(sel ? RGB(0xE7, 0xF5, 0xEC) : Theme::FieldHover));
                 DrawStr(gr, g_app.versions[(size_t)idx],
                         RectF(ir.X + SR(12), ir.Y, ir.Width - SR(30), ir.Height),
                         *F.sub, C(sel ? Theme::Accent : Theme::Text), StringAlignmentNear, true, true);
@@ -1398,6 +2142,9 @@ static void Paint(HWND hwnd) {
             }
             gr.ResetClip();
         }
+
+        // ---------------- 微软登录验证码弹窗（最上层） ----------------
+        if (g_app.msAnim > 0.001f) DrawMsDialog(gr, L, W, H, g_app.msAnim);
     }
 
     BitBlt(hdc, 0, 0, W, H, memDC, 0, 0, SRCCOPY);
@@ -1431,10 +2178,43 @@ static int DropdownItemAt(int x, int y) {
     return (idx >= 0 && idx < (int)g_app.versions.size()) ? idx : -1;
 }
 
+// 切到离线：只是这次不用账号，account.dat 保留，随时能切回来
+static void SelectOffline() {
+    if (g_ms.state == MS_LOGGED_OUT) return;
+    g_ms.state     = MS_LOGGED_OUT;
+    g_app.username = g_offlineName;
+    g_app.focus    = FOCUS_NONE;
+    if (g_app.hwnd) KillTimer(g_app.hwnd, 3);     // 取消还在跑的自动开浏览器
+    g_app.dlgWait  = 0;
+    AnimMsDialog(false);
+    PushLog(L"已切换到离线登录 · " + g_offlineName);
+    SaveConfig();
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+// 切到微软账号：以前登录过就静默续期，否则走设备码
+static void SelectMs() {
+    if (g_ms.state == MS_LOGGED_IN || g_ms.state == MS_WAITING || g_ms.state == MS_WORKING)
+        return;
+    if (!g_ms.refreshToken.empty()) {
+        InitMsLock();
+        g_ms.state = MS_WORKING;
+        PushLog(L"正在恢复微软登录 …");
+        HANDLE h = CreateThread(nullptr, 0, MsRefreshThread, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
+    } else {
+        StartMsLogin();
+    }
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
 static int HitTest(int x, int y) {
     Layout L = ComputeLayout();
     if (InRect(L.closeBtn, x, y))  return HIT_CLOSE;
     if (InRect(L.minBtn, x, y))    return HIT_MIN;
+    if (InRect(L.msOffBtn, x, y))  return HIT_MS_OFF;
+    if (InRect(L.msOnBtn, x, y))   return HIT_MS_ON;
+    if (g_ms.state == MS_LOGGED_IN && InRect(L.msUnbind, x, y)) return HIT_MS_UNBIND;
     if (InRect(L.userBox, x, y))   return HIT_USER;
     if (InRect(L.verBox, x, y))    return HIT_VER;
     if (InRect(L.browseBtn, x, y)) return HIT_BROWSE;
@@ -1511,7 +2291,114 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_APP_MS: {
+        if (wParam == 1) {
+            // 登录码就绪：复制到剪贴板 + 打开授权页 + 写日志
+            EnterCriticalSection(&g_msLock);
+            g_ms.userCode  = g_msShared.userCode;
+            g_ms.verifyUri = g_msShared.uri;
+            LeaveCriticalSection(&g_msLock);
+            g_ms.state = MS_WAITING;
+
+            const std::wstring code = g_ms.userCode;
+            if (OpenClipboard(hwnd)) {
+                EmptyClipboard();
+                HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, (code.size() + 1) * sizeof(wchar_t));
+                if (hg) {
+                    void* p = GlobalLock(hg);
+                    if (p) {
+                        memcpy(p, code.c_str(), (code.size() + 1) * sizeof(wchar_t));
+                        GlobalUnlock(hg);
+                        SetClipboardData(CF_UNICODETEXT, hg);
+                    } else {
+                        GlobalFree(hg);
+                    }
+                }
+                CloseClipboard();
+            }
+            PushLog(L"验证码 " + code + L"（已复制到剪贴板）");
+            // 先弹窗把码亮出来，停留 5 秒（带倒计时）再唤起浏览器，让用户有时间看清
+            g_app.dlgWait = 5;
+            AnimMsDialog(true);
+            SetTimer(hwnd, 3, 1000, nullptr);
+        } else {
+            KillTimer(hwnd, 3);
+            g_app.dlgWait = 0;
+            AnimMsDialog(false);
+            EnterCriticalSection(&g_msLock);
+            const MsShared s = g_msShared;
+            LeaveCriticalSection(&g_msLock);
+
+            if (s.ok) {
+                g_ms.state        = MS_LOGGED_IN;
+                g_ms.name         = s.name;
+                g_ms.uuid         = s.uuid;
+                g_ms.xuid         = s.xuid;
+                g_ms.accessToken  = s.mcToken;
+                if (!s.refresh.empty()) g_ms.refreshToken = s.refresh;
+                g_ms.err.clear();
+                // 昵称框只显示账号的正版游戏 ID（正版账号不允许再手改）
+                g_app.username    = s.name;
+                g_app.focus       = FOCUS_NONE;
+                PushLog((s.silent ? L"已恢复正版 · " : L"已登录正版 · ") + s.name);
+            } else {
+                g_ms.state     = MS_LOGGED_OUT;
+                g_ms.err       = s.err;
+                g_app.username = g_offlineName;
+                if (!s.silent)                          PushLog(L"登录失败：" + s.err);
+                else if (s.err != L"没有已保存的账号")   PushLog(L"自动登录失败：" + s.err);
+            }
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+
     case WM_TIMER: {
+        if (wParam == 2) {                       // 弹窗动画（15ms 一帧，160ms 跑完）
+            const float dt = 0.015f / 0.16f;
+            const float target = g_app.msDlg ? 1.0f : 0.0f;
+            if (g_app.msAnim < target)      g_app.msAnim = std::min(target, g_app.msAnim + dt);
+            else if (g_app.msAnim > target) g_app.msAnim = std::max(target, g_app.msAnim - dt);
+            if (std::fabs(g_app.msAnim - target) < 0.001f) {
+                g_app.msAnim = target;
+                KillTimer(hwnd, 2);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        if (wParam == 3) {                       // 弹窗倒计时：到点后唤起浏览器
+            InvalidateRect(hwnd, nullptr, FALSE);
+            if (g_app.dlgWait > 0 && --g_app.dlgWait > 0) return 0;
+            KillTimer(hwnd, 3);
+            if (!g_ms.verifyUri.empty()) {
+                ShellExecuteW(nullptr, L"open", g_ms.verifyUri.c_str(), nullptr, nullptr,
+                              SW_SHOWNORMAL);
+                PushLog(L"已打开浏览器 " + g_ms.verifyUri);
+            }
+            return 0;
+        }
+        if (wParam == 4) {                       // 启动进度条：16ms 一帧平滑逼近目标值
+            if (!g_app.launching) { KillTimer(hwnd, 4); return 0; }
+            const float d = g_app.progressTarget - g_app.progress;
+            if (d > 0.005f) {
+                float v = d * 0.12f;             // 指数逼近，起步快收尾缓
+                if (v < 0.30f) v = 0.30f;        // 末段保底速度，别拖成爬
+                g_app.progress = std::min(g_app.progressTarget, g_app.progress + v);
+            }
+            // 进度跑满就地推进下一步：不必等下一次 100ms 业务定时器，避免每段末尾卡一下
+            if (LaunchTick()) {
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            Layout L = ComputeLayout();
+            RECT rc;
+            rc.left   = (LONG)(L.launchBtn.X - SR(2));
+            rc.top    = (LONG)(L.launchBtn.Y - SR(2));
+            rc.right  = (LONG)(L.launchBtn.X + L.launchBtn.Width + SR(2));
+            rc.bottom = (LONG)(L.launchBtn.Y + L.launchBtn.Height + SR(2));
+            InvalidateRect(hwnd, &rc, FALSE);
+            return 0;
+        }
         if (wParam != 1) break;
         g_app.caretTick++;
         if (g_app.caretTick % 5 == 0) g_app.caretOn = !g_app.caretOn;
@@ -1528,26 +2415,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         if (g_app.launching) {
-            int step = g_app.step;
-            if (!g_app.stepRan[step]) {
-                // 失败时 AbortLaunch 已重置状态，这里直接返回
-                if (!RunLaunchStep(step)) {
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                    return 0;
-                }
-                g_app.stepRan[step] = true;
-            }
-            g_app.progress += 4.0f;              // 每秒 40%，5 步合计约 2.5 秒
-            float cap = (float)(step + 1) * 20.0f;
-            if (g_app.progress >= cap) {
-                g_app.progress = cap;
-                if (step + 1 >= kLaunchStepCount) {
-                    FinishLaunch();
-                } else {
-                    g_app.step = step + 1;
-                    PushLog(kLaunchSteps[step + 1]);
-                }
-            }
+            LaunchTick();
         } else if (g_app.launched && g_app.resetTick > 0) {
             if (--g_app.resetTick == 0) g_app.launched = false;
         }
@@ -1567,10 +2435,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (di != g_app.ddHover) { g_app.ddHover = di; InvalidateRect(hwnd, nullptr, FALSE); }
 
         LPCWSTR cur = IDC_ARROW;
-        if (h == HIT_CLOSE || h == HIT_MIN || h == HIT_BROWSE || h == HIT_LAUNCH || h == HIT_VER)
+        if (h == HIT_CLOSE || h == HIT_MIN || h == HIT_BROWSE || h == HIT_LAUNCH ||
+            h == HIT_VER || h == HIT_MS_OFF || h == HIT_MS_ON || h == HIT_MS_UNBIND)
             cur = IDC_HAND;
         else if (h == HIT_USER)
-            cur = IDC_IBEAM;
+            cur = (g_ms.state == MS_LOGGED_IN) ? IDC_ARROW : IDC_IBEAM;
         else if (h == HIT_SLIDER)
             cur = IDC_SIZEWE;
         SetCursor(LoadCursorW(nullptr, cur));
@@ -1580,6 +2449,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
         SetFocus(hwnd);
+
+        if (g_app.msDlg) {                         // 弹窗吃掉所有点击
+            Layout L = ComputeLayout();
+            if (InRect(L.dlgOpen, x, y)) {
+                if (!g_ms.verifyUri.empty())
+                    ShellExecuteW(nullptr, L"open", g_ms.verifyUri.c_str(), nullptr, nullptr,
+                                  SW_SHOWNORMAL);
+                // 手动开过就别再自动开了
+                KillTimer(hwnd, 3);
+                g_app.dlgWait = 0;
+                PushLog(L"已打开浏览器 " + g_ms.verifyUri);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            } else {                               // 点其他任何地方 = 知道了
+                AnimMsDialog(false);
+            }
+            return 0;
+        }
 
         if (g_app.ddOpen) {                        // 浮层优先
             int di = DropdownItemAt(x, y);
@@ -1593,7 +2479,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         switch (HitTest(x, y)) {
         case HIT_CLOSE:  DestroyWindow(hwnd); return 0;
         case HIT_MIN:    ShowWindow(hwnd, SW_MINIMIZE); return 0;
-        case HIT_USER:   g_app.focus = FOCUS_USER; g_app.caretOn = true; g_app.caretTick = 0; break;
+        case HIT_MS_OFF: SelectOffline(); return 0;
+        case HIT_MS_ON:  SelectMs(); return 0;
+        case HIT_MS_UNBIND: LogoutMs(); return 0;
+        case HIT_USER:
+            if (g_ms.state == MS_LOGGED_IN) return 0;      // 已登录时昵称由账号决定
+            g_app.focus = FOCUS_USER; g_app.caretOn = true; g_app.caretTick = 0;
+            break;
         case HIT_VER:    g_app.ddOpen = true; g_app.ddScroll = 0; break;
         case HIT_BROWSE: BrowseGameDir(); return 0;
         case HIT_LAUNCH: StartLaunch(); break;
@@ -1629,13 +2521,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_CHAR: {
-        if (g_app.focus == FOCUS_USER) {
+        if (g_app.focus == FOCUS_USER && g_ms.state != MS_LOGGED_IN) {
             wchar_t ch = (wchar_t)wParam;
             if (ch == L'\b') {
                 if (!g_app.username.empty()) g_app.username.pop_back();
             } else if (ch >= 32 && ch != 127) {
                 if (g_app.username.size() < 16) g_app.username.push_back(ch);
             }
+            g_offlineName = g_app.username;      // 离线昵称单独记住，退出登录可还原
             g_app.caretOn = true;
             g_app.caretTick = 0;
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -1644,6 +2537,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_KEYDOWN:
+        if (g_app.msDlg) {
+            if (wParam == VK_ESCAPE || wParam == VK_RETURN) {
+                AnimMsDialog(false);
+                return 0;
+            }
+        }
         if (wParam == VK_ESCAPE) {
             if (g_app.ddOpen) { g_app.ddOpen = false; InvalidateRect(hwnd, nullptr, FALSE); }
             return 0;
@@ -1661,6 +2560,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
+        KillTimer(hwnd, 2);
         SaveConfig();
         PostQuitMessage(0);
         return 0;
@@ -1693,6 +2593,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     // ---- 配置 & 环境 ----
     std::wstring savedVer;
     LoadConfig(savedVer);
+    g_offlineName = g_app.username.empty() ? L"Steve" : g_app.username;
     if (g_app.gameDir.empty() || !PathExists(g_app.gameDir))
         g_app.gameDir = DefaultMinecraftDir();
 
@@ -1761,6 +2662,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
+
+    // 有已保存的账号就静默续期（不阻塞首屏）
+    MsAutoRefresh();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

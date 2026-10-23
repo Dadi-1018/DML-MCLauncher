@@ -16,7 +16,7 @@ if (WIN32)
 endif()
 
 target_compile_definitions(DML PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(DML PRIVATE gdiplus shell32 ole32 user32 gdi32)
+target_link_libraries(DML PRIVATE gdiplus shell32 ole32 user32 gdi32 winhttp crypt32 comdlg32)
 
 if (MSVC)
     target_compile_options(DML PRIVATE /EHsc /MT)
