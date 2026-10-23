@@ -48,6 +48,8 @@
 |---|---|
 | ![](docs/preview-launching.png) | ![](docs/preview-done.png) |
 
+> 截图中的日志首行（Java 路径）已做马赛克处理，避免暴露本机目录结构。
+
 ## 品牌资源
 
 标志取 **Dream Minecraft Launcher** 的缩写 **DML**，圆角应用方块 + 粗体字母组合 + 渐变。

@@ -19,8 +19,8 @@ IDR_LOGO     RCDATA  "../assets/logo/dml-logo-256.png"
 //  发版时只需改这里的 FILEVERSION / PRODUCTVERSION 与两个字符串
 // ---------------------------------------------------------------------------
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION     0,1,0,0
- PRODUCTVERSION  0,1,0,0
+ FILEVERSION     0,2,0,0
+ PRODUCTVERSION  0,2,0,0
  FILEFLAGSMASK   0x3fL
  FILEFLAGS       0x0L
  FILEOS          VOS_NT_WINDOWS32
@@ -33,12 +33,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Dadi"
             VALUE "FileDescription",  "Dream Minecraft Launcher"
-            VALUE "FileVersion",      "0.1.0"
+            VALUE "FileVersion",      "0.2.0"
             VALUE "InternalName",     "DML"
             VALUE "LegalCopyright",   "Copyright (c) 2026 Dadi"
             VALUE "OriginalFilename", "DML.exe"
             VALUE "ProductName",      "Dream Minecraft Launcher"
-            VALUE "ProductVersion",   "0.1.0"
+            VALUE "ProductVersion",   "0.2.0"
         END
     END
     BLOCK "VarFileInfo"
