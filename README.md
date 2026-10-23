@@ -1,5 +1,9 @@
 # MCLite —— 极简 Minecraft 启动器示例（C++）
 
+<p align="center">
+  <img src="assets/logo/dml-lockup.png" alt="Dream Minecraft Launcher" width="520">
+</p>
+
 一个**纯 C++ / Win32 / GDI+** 编写的 Minecraft 启动器样本程序：无第三方 UI 库、无运行时依赖，
 编译产物只有一个 exe。界面为深色、无边框圆角窗口，所有控件（输入框、下拉框、滑块、按钮、
 日志面板）均为手工绘制，可直接作为二次开发的骨架。
@@ -38,6 +42,22 @@
 | 启动进度 | 启动完成 |
 |---|---|
 | ![](docs/preview-launching.png) | ![](docs/preview-done.png) |
+
+## 品牌资源
+
+标志取 **Dream Minecraft Launcher** 的缩写 **DML**，圆角应用方块 + 粗体字母组合 + 渐变，
+配色跟随应用主题（深色底 / 草绿 `#4ADE80`）。
+
+| 文件 | 用途 |
+|---|---|
+| `assets/logo/dml-logo-1024.png` | 主图标，1024×1024，圆角外透明 |
+| `assets/logo/dml-logo-512.png` / `-256.png` | 常用尺寸 |
+| `assets/logo/dml.ico` | Windows 多尺寸图标（16–256） |
+| `assets/logo/dml-lockup.png` | 横版标志（图标 + 字标），深色底板，浅色背景下同样可读 |
+| `assets/logo/generate.py` | 生成脚本，改配色/字距后重跑即可复现全部产物 |
+
+如需换配色，只改 `generate.py` 顶部的 `GREEN` / `GREEN_LO` / `BG_A` / `BG_B` 四个常量，
+再执行 `python assets/logo/generate.py`。
 
 ## 目录结构
 
