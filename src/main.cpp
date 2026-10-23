@@ -1231,10 +1231,9 @@ static void Paint(HWND hwnd) {
 
         // ---------------- 头部 ----------------
         DrawLogo(gr, L.logo);
-        DrawStr(gr, L"Dream Minecraft Launcher", RectF(S(80), S(14), S(460), S(28)),
+        // 单行标题：与 40px 高的标志垂直居中对齐（标志 y=20..60，标题高 28 -> y=26）
+        DrawStr(gr, L"Dream Minecraft Launcher", RectF(S(80), S(26), S(460), S(28)),
                 *F.title, C(Theme::Text));
-        DrawStr(gr, L"DML",
-                RectF(S(81), S(44), S(460), S(18)), *F.sub, C(Theme::Muted));
         DrawWindowButtons(gr, L);
 
         // ---------------- 卡片一：账户 / 版本 / 内存 ----------------
