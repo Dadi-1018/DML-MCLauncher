@@ -2746,7 +2746,7 @@ static void AnimMsDialog(bool open) {
     if (g_app.hwnd) InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
-static const wchar_t* kAppVersion = L"0.2.0";   // 与 res/app.rc 的版本资源保持一致
+static const wchar_t* kAppVersion = L"0.3.0";   // 与 res/app.rc 的版本资源保持一致
 
 // 标题下方的三个标签：开始 / 下载 / 设置
 static const wchar_t* kTabName[3] = { L"开始", L"下载", L"设置" };
