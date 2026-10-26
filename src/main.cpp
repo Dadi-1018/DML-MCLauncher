@@ -22,6 +22,7 @@
 #include <windowsx.h>
 #include <shlobj.h>
 #include <shellapi.h>
+#include <commdlg.h>
 #include <winhttp.h>
 #include <wincrypt.h>
 #include <gdiplus.h>
@@ -32,10 +33,12 @@
 #include <stdio.h>
 #include <string>
 #include <vector>
+#include <set>
 #include <fstream>
 #include <algorithm>
 #include <functional>
 #include <utility>
+#include <atomic>
 #include <cmath>
 
 using namespace Gdiplus;
@@ -44,6 +47,8 @@ using namespace Gdiplus;
 #define WM_APP_LOG (WM_APP + 1)
 // 微软登录线程 → UI：wParam = 1 设备码就绪 / 2 流程结束（成功或失败，看 g_msShared.ok）
 #define WM_APP_MS  (WM_APP + 2)
+// 下载线程 → UI：wParam = 1 版本列表就绪 / 2 下载完成 / 3 下载失败或取消
+#define WM_APP_DL  (WM_APP + 3)
 
 #ifdef _MSC_VER
 #pragma comment(lib, "gdiplus.lib")
@@ -174,6 +179,11 @@ static REAL MeasureW(Graphics& gr, const std::wstring& s, Font& f) {
     return box.Width;
 }
 
+static bool InRect(const RectF& r, int x, int y) {
+    return (REAL)x >= r.X && (REAL)x <= r.X + r.Width &&
+           (REAL)y >= r.Y && (REAL)y <= r.Y + r.Height;
+}
+
 // ============================================================================
 //  字体
 // ============================================================================
@@ -207,20 +217,35 @@ static void FreeFonts() {
 // ============================================================================
 struct Layout {
     RectF logo;
-    RectF msOffBtn;      // 昵称框下方：离线登录 / 微软登录 两个选项
+    RectF tab[3];        // 标题下方：开始 / 下载 / 设置
+
+    // ---- 开始页 ----
+    RectF panel1;        // 昵称 / 账号方式 / 版本
+    RectF userBox;
+    RectF verBox;
+    RectF msOffBtn;      // 昵称框下方：离线登录 / 微软登录
     RectF msOnBtn;
     RectF msUnbind;      // 仅已登录时显示
+    RectF launchBtn;
+    RectF logArea;
+
+    // ---- 下载页 ----
+    RectF dlPanel;
+
+    // ---- 设置页 ----
+    RectF dirPanel;
+    RectF javaPanel;
+    RectF memPanel;
+    RectF argPanel;      // 附加 JVM 参数
+    RectF argBox;
+    RectF browseBtn;
+    RectF javaBtn;
+    RectF sliderTrack;
+
+    // ---- 弹窗 ----
     RectF dlgCard;       // 验证码弹窗
     RectF dlgOpen;
     RectF dlgOk;
-    RectF panel1;
-    RectF panel2;
-    RectF userBox;
-    RectF verBox;
-    RectF sliderTrack;
-    RectF browseBtn;
-    RectF launchBtn;
-    RectF logArea;
     RectF closeBtn;
     RectF minBtn;
 };
@@ -231,31 +256,50 @@ static const int WIN_H = 500;
 static Layout ComputeLayout() {
     Layout L;
     L.logo        = RectF(S(28),  S(20),  S(40),  S(40));
-    L.msOffBtn    = RectF(S(52),  S(172), S(78),  S(22));
-    L.msOnBtn     = RectF(S(136), S(172), S(78),  S(22));
-    L.msUnbind    = RectF(S(222), S(168), S(84),  S(30));
+    L.tab[0]      = RectF(S(28),  S(64),  S(70),  S(30));
+    L.tab[1]      = RectF(S(106), S(64),  S(70),  S(30));
+    L.tab[2]      = RectF(S(184), S(64),  S(70),  S(30));
+
+    L.minBtn      = RectF(S(662), S(16),  S(30),  S(30));
+    L.closeBtn    = RectF(S(700), S(16),  S(30),  S(30));
+
+    // 开始页
+    L.panel1      = RectF(S(28),  S(104), S(704), S(124));
+    L.userBox     = RectF(S(52),  S(148), S(300), S(42));
+    L.msOffBtn    = RectF(S(52),  S(194), S(78),  S(22));
+    L.msOnBtn     = RectF(S(136), S(194), S(78),  S(22));
+    L.msUnbind    = RectF(S(222), S(190), S(84),  S(30));
+    L.verBox      = RectF(S(376), S(148), S(332), S(42));
+    L.launchBtn   = RectF(S(28),  S(240), S(704), S(50));
+    L.logArea     = RectF(S(28),  S(306), S(704), S(164));
+
+    // 下载页
+    L.dlPanel     = RectF(S(28),  S(104), S(704), S(366));
+
+    // 设置页
+    L.dirPanel    = RectF(S(28),  S(104), S(704), S(68));
+    L.browseBtn   = RectF(S(636), S(120), S(72),  S(34));
+    L.javaPanel   = RectF(S(28),  S(180), S(704), S(68));
+    L.javaBtn     = RectF(S(636), S(196), S(72),  S(34));
+    L.memPanel    = RectF(S(28),  S(256), S(704), S(70));
+    L.sliderTrack = RectF(S(52),  S(306), S(656), S(6));
+    L.argPanel    = RectF(S(28),  S(334), S(704), S(70));
+    L.argBox      = RectF(S(52),  S(362), S(656), S(32));
+
+    // 微软验证码弹窗
     L.dlgCard     = RectF(S(150), S(140), S(460), S(212));
     L.dlgOpen     = RectF(S(247), S(296), S(150), S(34));
     L.dlgOk       = RectF(S(409), S(296), S(104), S(34));
-    L.minBtn      = RectF(S(662), S(16),  S(30),  S(30));
-    L.closeBtn    = RectF(S(700), S(16),  S(30),  S(30));
-    L.panel1      = RectF(S(28),  S(82),  S(704), S(166));
-    L.userBox     = RectF(S(52),  S(126), S(300), S(42));
-    L.verBox      = RectF(S(376), S(126), S(332), S(42));
-    L.sliderTrack = RectF(S(52),  S(224), S(656), S(6));
-    L.panel2      = RectF(S(28),  S(262), S(704), S(66));
-    L.browseBtn   = RectF(S(636), S(278), S(72),  S(34));
-    L.launchBtn   = RectF(S(28),  S(340), S(704), S(50));
-    L.logArea     = RectF(S(28),  S(406), S(704), S(64));
     return L;
 }
 
 // ============================================================================
 //  应用状态
 // ============================================================================
-enum { HIT_NONE = 0, HIT_CLOSE, HIT_MIN, HIT_USER, HIT_VER, HIT_SLIDER, HIT_BROWSE, HIT_LAUNCH,
+enum { HIT_NONE = 0, HIT_CLOSE, HIT_MIN, HIT_TAB0, HIT_TAB1, HIT_TAB2,
+       HIT_USER, HIT_VER, HIT_SLIDER, HIT_BROWSE, HIT_JAVA, HIT_ARGS, HIT_LAUNCH,
        HIT_MS_OFF, HIT_MS_ON, HIT_MS_UNBIND };
-enum { FOCUS_NONE = 0, FOCUS_USER };
+enum { FOCUS_NONE = 0, FOCUS_USER, FOCUS_ARGS };
 
 static const int DD_ITEM_H   = 34;   // 下拉项高度（逻辑像素）
 static const int DD_MAX_SHOW = 6;    // 下拉最多显示条数
@@ -263,7 +307,10 @@ static const int DD_MAX_SHOW = 6;    // 下拉最多显示条数
 struct AppState {
     HWND hwnd = nullptr;
 
+    int  page = 0;                   // 0 开始 / 1 下载 / 2 设置
+
     std::wstring username = L"Steve";
+    std::wstring jvmArgs;            // 附加 JVM 参数，原样追加到 java 命令行
     std::wstring gameDir;
     std::wstring javaPath;
     std::vector<std::wstring> versions;
@@ -294,6 +341,14 @@ struct AppState {
     bool  msDlg     = false;         // 微软登录验证码弹窗（逻辑开关）
     float msAnim    = 0.0f;          // 弹窗动画进度 0..1
     int   dlgWait   = 0;             // 弹窗停留后打开浏览器的倒计时（秒，0 = 已开）
+
+    // ---- 下载页 ----
+    int   dlPhase  = 0;              // 0 拉列表 / 1 选版本 / 2 下载中 / 3 完成 / 4 失败
+    int   dlFilter = 0;              // 0 正式版 / 1 快照 / 2 全部
+    int   dlSel    = 0;              // 选中项（在 g_dlView 里的下标）
+    int   dlScroll = 0;
+    int   dlHover  = -1;
+    std::wstring dlTarget;           // 正在下载 / 刚下载完的版本 id
 };
 
 static AppState g_app;
@@ -350,6 +405,14 @@ static std::wstring DefaultMinecraftDir() {
     return L"";
 }
 
+// 不管 .minecraft 在不在，都返回 %APPDATA%\.minecraft：下载新版本时要靠它把目录建出来
+static std::wstring AppDataMinecraftDir() {
+    wchar_t buf[MAX_PATH] = {0};
+    if (GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH))
+        return std::wstring(buf) + L"\\.minecraft";
+    return L"";
+}
+
 static void SaveConfig() {
     std::wstring dir = AppDataConfigDir();
     CreateDirectoryW(dir.c_str(), nullptr);
@@ -359,6 +422,8 @@ static void SaveConfig() {
     f << "version="  << W2U8(g_app.versions.empty() ? std::wstring() : g_app.versions[(size_t)g_app.versionIdx]) << "\n";
     f << "memory="   << g_app.memGb << "\n";
     f << "gamedir="  << W2U8(g_app.gameDir) << "\n";
+    f << "java="     << W2U8(g_app.javaPath) << "\n";
+    f << "jvmargs="  << W2U8(g_app.jvmArgs) << "\n";
 }
 
 static void LoadConfig(std::wstring& outVersion) {
@@ -375,6 +440,8 @@ static void LoadConfig(std::wstring& outVersion) {
         else if (k == "version")  outVersion = v;
         else if (k == "memory")   g_app.memGb = std::max(1, std::min(16, (int)wcstol(v.c_str(), nullptr, 10)));
         else if (k == "gamedir")  g_app.gameDir = v;
+        else if (k == "java")     g_app.javaPath = v;
+        else if (k == "jvmargs")  g_app.jvmArgs = v;
     }
 }
 
@@ -450,7 +517,7 @@ static std::wstring DetectJava() {
 // ============================================================================
 static void PushLog(const std::wstring& s) {
     g_app.logs.push_back(s);
-    while (g_app.logs.size() > 4) g_app.logs.erase(g_app.logs.begin());
+    while (g_app.logs.size() > 9) g_app.logs.erase(g_app.logs.begin());
 }
 
 // ============================================================================
@@ -886,6 +953,8 @@ static bool ResolveVersion(const std::wstring& gameDir, const std::wstring& id, 
     plan.command = QuoteArg(java);
     plan.command += L" -Xmx" + std::to_wstring(g_app.memGb) + L"G";
     plan.command += L" -Xms" + std::to_wstring(std::max(1, g_app.memGb / 2)) + L"G";
+    // 设置页里填的附加参数：原样拼进去（带引号的 -Dxxx="a b" 也能用），不逐段转义
+    if (!g_app.jvmArgs.empty()) plan.command += L" " + g_app.jvmArgs;
 
     if (jvmArgs.empty()) {
         plan.command += L" -Djava.library.path=" + QuoteArg(plan.nativesDir);
@@ -1004,7 +1073,9 @@ static bool SpawnGame(const std::wstring& cmd, const std::wstring& cwd, std::wst
 //          libraries / assets 缺失文件的自动下载、assets 完整性校验。
 // ============================================================================
 static std::wstring EffectiveGameDir() {
-    return g_app.gameDir.empty() ? DefaultMinecraftDir() : g_app.gameDir;
+    if (!g_app.gameDir.empty()) return g_app.gameDir;
+    std::wstring d = DefaultMinecraftDir();
+    return d.empty() ? AppDataMinecraftDir() : d;
 }
 
 static std::wstring CurrentVersionId() {
@@ -1849,6 +1920,737 @@ static void DrawLogo(Graphics& gr, const RectF& r) {
     StrokeRound(gr, r, SR(11), Color(36, 0, 0, 0), SR(1));
 }
 
+// ============================================================================
+//  下载 Minecraft 版本（BMCLAPI 镜像）
+//    /mc/game/version_manifest_v2.json   版本清单
+//    /version/<id>/json                  版本 JSON
+//    /version/<id>/client                客户端 jar
+//    /maven/<path>                       依赖库
+//    /v1/packages/<sha>/<file>.json      资源索引
+//    /assets/<h2>/<hash>                 资源对象
+//  文件完整性按 size 校验，已存在的文件直接跳过（天然支持断点续传）
+// ============================================================================
+static const wchar_t* kDlBase = L"https://bmclapi2.bangbang93.com";
+static const int      kDlThreads = 16;      // 并发连接数：资源对象都是小文件，靠并发拉吞吐
+static const int      DL_ROWS    = 6;       // 列表可见行数
+static const int      DL_ROW_H   = 32;      // 行高（逻辑像素）
+
+struct DlVersion {
+    std::wstring id;
+    std::wstring type;      // release / snapshot / old_beta / old_alpha
+    std::wstring date;      // releaseTime 前 10 位
+};
+
+struct DlTask {
+    std::wstring url;
+    std::wstring path;      // 绝对路径
+    long long    size = -1; // 期望字节数（-1 = 未知）
+};
+
+static std::vector<DlVersion> g_dlList;     // 远端版本列表（清单线程写，UI 读）
+static std::vector<int>       g_dlView;     // 按筛选条件过滤后的下标
+static std::wstring           g_dlErr;      // 失败原因
+static std::wstring           g_dlCur;      // 当前正在下载的文件
+
+static std::atomic<int>       g_dlFilesDone{0};
+static std::atomic<int>       g_dlFilesTotal{0};
+static std::atomic<long long> g_dlBytesDone{0};
+static std::atomic<long long> g_dlBytesTotal{0};
+static std::atomic<bool>      g_dlCancel{false};
+static std::atomic<bool>      g_dlBusy{false};     // 有下载线程在跑（防止并发两份）
+
+static CRITICAL_SECTION g_dlLock;
+static bool             g_dlLockReady = false;
+
+static void InitDlLock() {
+    if (!g_dlLockReady) { InitializeCriticalSection(&g_dlLock); g_dlLockReady = true; }
+}
+
+// ---- 路径 / 文件小工具 ----
+static std::wstring FileNameOf(const std::wstring& p) {
+    size_t s = p.find_last_of(L"\\/");
+    return s == std::wstring::npos ? p : p.substr(s + 1);
+}
+
+static std::wstring ParentDirOf(const std::wstring& p) {
+    size_t s = p.find_last_of(L"\\/");
+    return s == std::wstring::npos ? std::wstring() : p.substr(0, s);
+}
+
+static void MakeDirs(const std::wstring& path) {
+    if (path.size() < 3) return;
+    for (size_t i = 3; i <= path.size(); ++i) {
+        if (i < path.size() && path[i] != L'\\' && path[i] != L'/') continue;
+        CreateDirectoryW(path.substr(0, i).c_str(), nullptr);
+    }
+}
+
+static long long FileSizeOf(const std::wstring& p) {
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fa)) return -1;
+    return ((long long)fa.nFileSizeHigh << 32) | (long long)fa.nFileSizeLow;
+}
+
+static bool WriteAllBytes(const std::wstring& path, const std::string& data) {
+    FILE* fp = _wfopen(path.c_str(), L"wb");
+    if (!fp) return false;
+    const size_t n = data.empty() ? 0 : fwrite(data.data(), 1, data.size(), fp);
+    fclose(fp);
+    return n == data.size();
+}
+
+static std::wstring HumanSize(long long n) {
+    if (n < 1024)        return std::to_wstring(n) + L" B";
+    if (n < 1048576LL)   return std::to_wstring(n / 1024) + L" KB";
+    wchar_t b[48];
+    if (n < 1073741824LL) swprintf(b, 48, L"%.1f MB", (double)n / 1048576.0);
+    else                  swprintf(b, 48, L"%.2f GB", (double)n / 1073741824.0);
+    return b;
+}
+
+// 把 Mojang 官方地址换成 BMCLAPI 镜像（版本 JSON 里仍是官方 URL）
+static std::wstring MirrorUrl(std::wstring u) {
+    struct { const wchar_t* from; const wchar_t* to; } map[] = {
+        { L"https://libraries.minecraft.net",          L"https://bmclapi2.bangbang93.com/maven"  },
+        { L"https://resources.download.minecraft.net", L"https://bmclapi2.bangbang93.com/assets" },
+        { L"https://piston-meta.mojang.com",           L"https://bmclapi2.bangbang93.com"        },
+        { L"https://launchermeta.mojang.com",          L"https://bmclapi2.bangbang93.com"        },
+        { L"https://piston-data.mojang.com",           L"https://bmclapi2.bangbang93.com"        },
+        { L"https://launcher.mojang.com",              L"https://bmclapi2.bangbang93.com"        },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
+        size_t p = u.find(map[i].from);
+        if (p != std::wstring::npos)
+            u.replace(p, wcslen(map[i].from), map[i].to);
+    }
+    return u;
+}
+
+// ---- 单文件下载：流式写 .part，完成后再改名，断点续传由「跳过已存在」实现 ----
+static bool HttpDownload(const std::wstring& url, const std::wstring& dst, long long expect,
+                         std::wstring& err) {
+    err.clear();
+    URL_COMPONENTS uc;
+    ZeroMemory(&uc, sizeof(uc));
+    uc.dwStructSize = sizeof(uc);
+    wchar_t host[256]  = {0};
+    wchar_t path[2048] = {0};
+    uc.lpszHostName    = host; uc.dwHostNameLength = 255;
+    uc.lpszUrlPath     = path; uc.dwUrlPathLength  = 2047;
+    if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc)) { err = L"URL 解析失败"; return false; }
+
+    HINTERNET ses = WinHttpOpen(L"DreamMinecraftLauncher/0.2", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses) { err = L"网络初始化失败"; return false; }
+    WinHttpSetTimeouts(ses, 15000, 15000, 30000, 60000);
+
+    bool ok = false;
+    HINTERNET con = nullptr, req = nullptr;
+    FILE* fp = nullptr;
+    long long got = 0;
+    const std::wstring tmp = dst + L".part";
+
+    do {
+        con = WinHttpConnect(ses, host, uc.nPort, 0);
+        if (!con) { err = L"无法连接服务器"; break; }
+        req = WinHttpOpenRequest(con, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+                                 WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                 uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+        if (!req) { err = L"创建请求失败"; break; }
+        // 镜像会给 302 跳到 CDN，WinHTTP 默认策略会自动跟随
+        if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+            !WinHttpReceiveResponse(req, nullptr)) {
+            err = L"请求失败（" + std::to_wstring(GetLastError()) + L"）";
+            break;
+        }
+        DWORD st = 0, sl = sizeof(st);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &st, &sl, WINHTTP_NO_HEADER_INDEX);
+        if (st != 200) { err = L"HTTP " + std::to_wstring(st); break; }
+
+        MakeDirs(ParentDirOf(dst));
+        fp = _wfopen(tmp.c_str(), L"wb");
+        if (!fp) { err = L"无法写入文件"; break; }
+
+        for (;;) {
+            DWORD avail = 0;
+            if (!WinHttpQueryDataAvailable(req, &avail) || avail == 0) break;
+            std::string buf;
+            buf.resize(avail);
+            DWORD rd = 0;
+            if (!WinHttpReadData(req, &buf[0], avail, &rd) || rd == 0) break;
+            if (fwrite(buf.data(), 1, rd, fp) != rd) { err = L"写入文件失败"; break; }
+            got += rd;
+            g_dlBytesDone.fetch_add((long long)rd);
+        }
+        ok = err.empty();
+    } while (0);
+
+    if (fp) fclose(fp);
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    WinHttpCloseHandle(ses);
+
+    if (!ok) {
+        DeleteFileW(tmp.c_str());
+        if (err.empty()) err = L"下载中断";
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        err = L"重命名失败";
+        return false;
+    }
+    if (expect > 0 && got != expect) {
+        DeleteFileW(dst.c_str());
+        err = L"大小不符（" + std::to_wstring(got) + L"/" + std::to_wstring(expect) + L"）";
+        return false;
+    }
+    return true;
+}
+
+// ---- 版本列表 ----
+static const wchar_t* DlTypeName(const std::wstring& t) {
+    if (t == L"release")   return L"正式版";
+    if (t == L"snapshot")  return L"快照";
+    if (t == L"old_beta")  return L"旧 Beta";
+    if (t == L"old_alpha") return L"旧 Alpha";
+    return L"其他";
+}
+
+static void RebuildDlView() {
+    g_dlView.clear();
+    for (size_t i = 0; i < g_dlList.size(); ++i) {
+        const std::wstring& t = g_dlList[i].type;
+        if (g_app.dlFilter == 0 && t != L"release")  continue;
+        if (g_app.dlFilter == 1 && t != L"snapshot") continue;
+        g_dlView.push_back((int)i);
+    }
+    if (g_app.dlSel >= (int)g_dlView.size()) g_app.dlSel = (int)g_dlView.size() - 1;
+    if (g_app.dlSel < 0) g_app.dlSel = 0;
+    if (g_app.dlScroll > (int)g_dlView.size() - DL_ROWS)
+        g_app.dlScroll = std::max(0, (int)g_dlView.size() - DL_ROWS);
+}
+
+static DWORD WINAPI DlManifestThread(LPVOID) {
+    HttpResp r = HttpCall(L"GET", std::wstring(kDlBase) + L"/mc/game/version_manifest_v2.json",
+                          std::string(), std::wstring(), std::wstring());
+    std::vector<DlVersion> list;
+    std::wstring err;
+
+    if (r.status == 200 && !r.body.empty()) {
+        JVal root;
+        if (ParseJsonUtf8(r.body, root)) {
+            const JVal* vs = root.get(L"versions");
+            if (vs && vs->t == JVal::ARR) {
+                for (size_t i = 0; i < vs->a.size(); ++i) {
+                    DlVersion d;
+                    d.id   = vs->a[i].str(L"id");
+                    d.type = vs->a[i].str(L"type");
+                    d.date = vs->a[i].str(L"releaseTime");
+                    if (d.date.size() >= 10) d.date = d.date.substr(0, 10);
+                    if (!d.id.empty()) list.push_back(d);
+                }
+            }
+        }
+        if (list.empty()) err = L"版本列表为空或解析失败";
+    } else {
+        err = r.status ? (L"获取版本列表失败（HTTP " + std::to_wstring(r.status) + L"）")
+                       : (r.err.empty() ? L"获取版本列表失败" : r.err);
+    }
+
+    EnterCriticalSection(&g_dlLock);
+    g_dlList.swap(list);
+    g_dlErr = err;
+    LeaveCriticalSection(&g_dlLock);
+
+    if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_APP_DL, 1, 0);
+    return 0;
+}
+
+// ---- 下载计划：版本 JSON + 客户端 jar + 依赖库 + 资源索引 + 资源对象 ----
+static void AddTask(std::vector<DlTask>& tasks, std::set<std::wstring>& seen,
+                    const std::wstring& url, const std::wstring& path, long long size) {
+    if (url.empty() || path.empty()) return;
+    if (!seen.insert(path).second) return;
+    DlTask t;
+    t.url  = url;
+    t.path = path;
+    t.size = size;
+    tasks.push_back(t);
+}
+
+static bool BuildDlPlan(const std::wstring& gameDir, const std::wstring& id,
+                        std::vector<DlTask>& tasks, std::wstring& err) {
+    const std::wstring base(kDlBase);
+    const std::wstring vdir = gameDir + L"\\versions\\" + id;
+
+    HttpResp r = HttpCall(L"GET", base + L"/version/" + id + L"/json",
+                          std::string(), std::wstring(), std::wstring());
+    if (r.status != 200 || r.body.empty()) {
+        err = r.status ? (L"获取版本清单失败（HTTP " + std::to_wstring(r.status) + L"）")
+                       : (r.err.empty() ? L"获取版本清单失败" : r.err);
+        return false;
+    }
+    JVal root;
+    if (!ParseJsonUtf8(r.body, root) || root.t != JVal::OBJ) { err = L"版本清单解析失败"; return false; }
+
+    MakeDirs(vdir);
+    if (!WriteAllBytes(vdir + L"\\" + id + L".json", r.body)) { err = L"版本清单写入失败"; return false; }
+
+    std::set<std::wstring> seen;
+
+    // 客户端 jar：直接走镜像的 /version/<id>/client，比改写 JSON 里的 URL 更稳
+    long long clientSize = -1;
+    if (const JVal* dl = root.get(L"downloads")) {
+        const JVal* c = dl->get(L"client");
+        const JVal* s = c ? c->get(L"size") : nullptr;
+        if (s && s->t == JVal::NUM) clientSize = (long long)s->num;
+    }
+    AddTask(tasks, seen, base + L"/version/" + id + L"/client",
+            vdir + L"\\" + id + L".jar", clientSize);
+
+    // 依赖库：artifact 与 windows 分类器（老版本的 natives 在 classifiers 里）
+    const JVal* libs = root.get(L"libraries");
+    if (libs && libs->t == JVal::ARR) {
+        for (size_t i = 0; i < libs->a.size(); ++i) {
+            const JVal& lib = libs->a[i];
+            if (!RulesAllow(lib.get(L"rules"))) continue;
+            const std::wstring name = lib.str(L"name");
+            const JVal* dl = lib.get(L"downloads");
+
+            if (!dl) {                                  // 很老的版本：没有 downloads，按 maven 规则拼
+                std::wstring rel = MavenRel(name, L"");
+                if (!rel.empty()) {
+                    std::wstring url = base + L"/maven/" + rel;
+                    for (size_t k = 0; k < rel.size(); ++k) if (rel[k] == L'/') rel[k] = L'\\';
+                    AddTask(tasks, seen, url, gameDir + L"\\libraries\\" + rel, -1);
+                }
+                continue;
+            }
+
+            const JVal* art = dl->get(L"artifact");
+            if (art) {
+                std::wstring rel = art->str(L"path"), url = art->str(L"url");
+                long long sz = -1;
+                if (const JVal* s = art->get(L"size")) if (s->t == JVal::NUM) sz = (long long)s->num;
+                if (!rel.empty()) {
+                    for (size_t k = 0; k < rel.size(); ++k) if (rel[k] == L'/') rel[k] = L'\\';
+                    if (url.empty()) {
+                        std::wstring mr = MavenRel(name, L"");
+                        for (size_t k = 0; k < mr.size(); ++k) if (mr[k] == L'/') mr[k] = L'\\';
+                        url = base + L"/maven/" + mr;
+                    }
+                    AddTask(tasks, seen, MirrorUrl(url), gameDir + L"\\libraries\\" + rel, sz);
+                }
+            }
+
+            const JVal* cls = dl->get(L"classifiers");
+            if (cls && cls->t == JVal::OBJ) {
+                for (size_t k = 0; k < cls->o.size(); ++k) {
+                    if (cls->o[k].first.find(L"windows") == std::wstring::npos) continue;
+                    const JVal& c = cls->o[k].second;
+                    std::wstring rel = c.str(L"path"), url = c.str(L"url");
+                    long long sz = -1;
+                    if (const JVal* s = c.get(L"size")) if (s->t == JVal::NUM) sz = (long long)s->num;
+                    if (rel.empty()) continue;
+                    for (size_t q = 0; q < rel.size(); ++q) if (rel[q] == L'/') rel[q] = L'\\';
+                    AddTask(tasks, seen, MirrorUrl(url), gameDir + L"\\libraries\\" + rel, sz);
+                }
+            }
+        }
+    }
+
+    // 资源索引：必须同步拿到内容才能列出资源对象
+    std::wstring aiId, aiUrl;
+    if (const JVal* ai = root.get(L"assetIndex")) {
+        aiId  = ai->str(L"id");
+        aiUrl = MirrorUrl(ai->str(L"url"));
+    }
+    if (!aiUrl.empty() && !aiId.empty()) {
+        HttpResp ir = HttpCall(L"GET", aiUrl, std::string(), std::wstring(), std::wstring());
+        if (ir.status != 200 || ir.body.empty()) { err = L"资源索引下载失败"; return false; }
+        MakeDirs(gameDir + L"\\assets\\indexes");
+        if (!WriteAllBytes(gameDir + L"\\assets\\indexes\\" + aiId + L".json", ir.body)) {
+            err = L"资源索引写入失败";
+            return false;
+        }
+        JVal idx;
+        if (ParseJsonUtf8(ir.body, idx)) {
+            const JVal* objs = idx.get(L"objects");
+            if (objs && objs->t == JVal::OBJ) {
+                for (size_t i = 0; i < objs->o.size(); ++i) {
+                    const JVal& o = objs->o[i].second;
+                    std::wstring hash = o.str(L"hash");
+                    if (hash.size() < 2) continue;
+                    long long sz = -1;
+                    if (const JVal* s = o.get(L"size")) if (s->t == JVal::NUM) sz = (long long)s->num;
+                    const std::wstring h2 = hash.substr(0, 2);
+                    AddTask(tasks, seen, base + L"/assets/" + h2 + L"/" + hash,
+                            gameDir + L"\\assets\\objects\\" + h2 + L"\\" + hash, sz);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+struct DlPool {
+    std::vector<DlTask>* tasks = nullptr;
+    std::atomic<size_t>  next{0};
+    std::atomic<int>     fails{0};
+};
+
+static DWORD WINAPI DlWorker(LPVOID param) {
+    DlPool* p = (DlPool*)param;
+    for (;;) {
+        if (g_dlCancel.load()) break;
+        const size_t i = p->next.fetch_add(1);
+        if (i >= p->tasks->size()) break;
+        const DlTask& t = (*p->tasks)[i];
+
+        const long long have = FileSizeOf(t.path);
+        const bool skip = (t.size > 0) ? (have == t.size) : (have > 0);
+        if (skip) {
+            if (t.size > 0) g_dlBytesDone.fetch_add(t.size);
+            g_dlFilesDone.fetch_add(1);
+            continue;
+        }
+
+        EnterCriticalSection(&g_dlLock);
+        g_dlCur = t.path;
+        LeaveCriticalSection(&g_dlLock);
+
+        std::wstring e;
+        if (!HttpDownload(t.url, t.path, t.size, e)) {
+            p->fails.fetch_add(1);
+            EnterCriticalSection(&g_dlLock);
+            if (g_dlErr.empty()) g_dlErr = FileNameOf(t.path) + L" 下载失败：" + e;
+            LeaveCriticalSection(&g_dlLock);
+        }
+        g_dlFilesDone.fetch_add(1);
+    }
+    return 0;
+}
+
+static DWORD WINAPI DlThread(LPVOID param) {
+    const std::wstring id = *(std::wstring*)param;
+    delete (std::wstring*)param;
+
+    g_dlCancel.store(false);
+    g_dlFilesDone.store(0);
+    g_dlFilesTotal.store(0);
+    g_dlBytesDone.store(0);
+    g_dlBytesTotal.store(0);
+    EnterCriticalSection(&g_dlLock);
+    g_dlErr.clear();
+    g_dlCur.clear();
+    LeaveCriticalSection(&g_dlLock);
+    const std::wstring gameDir = EffectiveGameDir();
+    std::vector<DlTask> tasks;
+    std::wstring err;
+    bool ok = false;
+    if (gameDir.empty()) {
+        err = L"无法确定游戏目录（%APPDATA% 不可用）";
+    } else {
+        ok = BuildDlPlan(gameDir, id, tasks, err);
+    }
+
+    if (ok) {
+        long long total = 0;
+        for (size_t i = 0; i < tasks.size(); ++i)
+            if (tasks[i].size > 0) total += tasks[i].size;
+        g_dlFilesTotal.store((int)tasks.size());
+        g_dlBytesTotal.store(total);
+
+        if (!tasks.empty()) {
+            DlPool pool;
+            pool.tasks = &tasks;
+            HANDLE hs[kDlThreads];
+            for (int i = 0; i < kDlThreads; ++i)
+                hs[i] = CreateThread(nullptr, 0, DlWorker, &pool, 0, nullptr);
+            for (int i = 0; i < kDlThreads; ++i) {
+                if (hs[i]) { WaitForSingleObject(hs[i], INFINITE); CloseHandle(hs[i]); }
+            }
+            if (pool.fails.load() > 0) {
+                ok = false;
+                EnterCriticalSection(&g_dlLock);
+                if (g_dlErr.empty())
+                    g_dlErr = L"有 " + std::to_wstring(pool.fails.load()) + L" 个文件下载失败";
+                LeaveCriticalSection(&g_dlLock);
+            }
+        }
+    } else {
+        EnterCriticalSection(&g_dlLock);
+        g_dlErr = err;
+        LeaveCriticalSection(&g_dlLock);
+    }
+
+    if (g_dlCancel.load()) {
+        ok = false;
+        EnterCriticalSection(&g_dlLock);
+        g_dlErr = L"已取消下载";
+        LeaveCriticalSection(&g_dlLock);
+    }
+    if (ok) g_dlBytesDone.store(g_dlBytesTotal.load());
+
+    if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_APP_DL, ok ? 2 : 3, 0);
+    return 0;
+}
+
+// ---- 下载页几何（绘制与命中测试共用，避免两边算错） ----
+static RectF DlPageRect() { return ComputeLayout().dlPanel; }
+
+static RectF DlSubRect(const RectF& p, REAL x, REAL y, REAL w, REAL h) {
+    return RectF(p.X + SR(x), p.Y + SR(y), SR(w), SR(h));
+}
+
+static RectF DlFilterRect(const RectF& p, int i) {
+    return DlSubRect(p, 24 + i * 78, 72, 70, 26);
+}
+static RectF DlGoRect(const RectF& p)     { return DlSubRect(p, 704 - 24 - 110, 312, 110, 34); }
+static RectF DlCancelRect(const RectF& p) { return DlSubRect(p, 704 - 24 - 110 - 10 - 96, 312, 96, 34); }
+
+static RectF DlListRect(const RectF& p) {
+    return DlSubRect(p, 24, 106, 704 - 48, DL_ROWS * DL_ROW_H);
+}
+static RectF DlRowRect(const RectF& p, int i) {
+    RectF l = DlListRect(p);
+    return RectF(l.X + SR(6), l.Y + SR(4) + (REAL)i * SR(DL_ROW_H),
+                 l.Width - SR(12), SR(DL_ROW_H - 4));
+}
+
+static int DlRowAt(const RectF& p, int x, int y) {
+    RectF l = DlListRect(p);
+    if (!InRect(l, x, y)) return -1;
+    const int i = (int)(((REAL)y - (l.Y + SR(4))) / SR(DL_ROW_H));
+    if (i < 0 || i >= DL_ROWS) return -1;
+    const int vi = g_app.dlScroll + i;
+    return (vi >= 0 && vi < (int)g_dlView.size()) ? vi : -1;
+}
+
+// 首次进入下载页时才去拉版本清单；切页不清下载状态
+static void OpenDownloadPage() {
+    InitDlLock();
+    if (!g_dlList.empty()) {
+        if (g_app.dlPhase == 0) g_app.dlPhase = 1;
+        return;
+    }
+    g_app.dlFilter = 0;
+    g_app.dlSel    = 0;
+    g_app.dlScroll = 0;
+    g_app.dlHover  = -1;
+    if (g_app.dlPhase == 2) return;               // 正在下载时别重拉
+    g_app.dlPhase = 0;
+    HANDLE h = CreateThread(nullptr, 0, DlManifestThread, nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
+}
+
+static void SwitchPage(int page) {
+    if (page < 0 || page > 2 || page == g_app.page) return;
+    if (page == 1) OpenDownloadPage();
+    g_app.page    = page;
+    g_app.ddOpen  = false;
+    g_app.ddHover = -1;
+    g_app.focus   = FOCUS_NONE;
+    g_app.hover   = HIT_NONE;
+    if (g_app.hwnd) InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+static void StartDlDownload() {
+    if (g_app.dlPhase != 1) return;
+    if (g_app.dlSel < 0 || g_app.dlSel >= (int)g_dlView.size()) return;
+
+    g_app.dlTarget = g_dlList[(size_t)g_dlView[(size_t)g_app.dlSel]].id;
+    g_app.dlPhase  = 2;
+    g_dlFilesDone.store(0);
+    g_dlFilesTotal.store(0);
+    g_dlBytesDone.store(0);
+    g_dlBytesTotal.store(0);
+    g_dlCancel.store(false);
+
+    HANDLE h = CreateThread(nullptr, 0, DlThread, new std::wstring(g_app.dlTarget), 0, nullptr);
+    if (h) CloseHandle(h);
+
+    PushLog(L"开始下载 " + g_app.dlTarget + L" …");
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+// ---- 下载页绘制（内嵌页面，不再是弹窗） ----
+static void DrawDlPage(Graphics& gr) {
+    RectF page = DlPageRect();
+    FillRound(gr, page, SR(14), C(Theme::Panel));
+    StrokeRound(gr, page, SR(14), C(Theme::PanelBorder), SR(1));
+
+    DrawStr(gr, L"下载游戏版本", DlSubRect(page, 24, 12, 420, 28), *F.title, C(Theme::Text));
+    DrawStr(gr, L"BMCLAPI 镜像 · 下载后即可直接启动", DlSubRect(page, 24, 42, 560, 18),
+            *F.sub, C(Theme::Muted));
+
+    const bool running = (g_app.dlPhase == 2);
+
+    if (running) {
+        // ---------------- 下载中：进度面板 ----------------
+        DrawStr(gr, g_app.dlTarget, DlSubRect(page, 24, 112, 656, 26), *F.title,
+                C(Theme::Text), StringAlignmentCenter);
+
+        const int   fn  = g_dlFilesDone.load(), ft = g_dlFilesTotal.load();
+        const long long bd = g_dlBytesDone.load(), bt = g_dlBytesTotal.load();
+        int pct = bt > 0 ? (int)(bd * 100 / bt) : (ft > 0 ? fn * 100 / ft : 0);
+        if (pct > 100) pct = 100;
+
+        DrawStr(gr, std::to_wstring(pct) + L"%", DlSubRect(page, 24, 146, 656, 44),
+                *F.title, C(Theme::Accent), StringAlignmentCenter);
+
+        RectF bar = DlSubRect(page, 44, 202, 704 - 88, 10);
+        FillRound(gr, bar, SR(5), C(Theme::Track));
+        if (pct > 0) {
+            REAL w = bar.Width * (REAL)pct / 100.0f;
+            if (w < SR(6)) w = SR(6);
+            FillRound(gr, RectF(bar.X, bar.Y, w, bar.Height), SR(5), C(Theme::Accent));
+        }
+
+        DrawStr(gr, L"已下载 " + std::to_wstring(fn) + L" / " + std::to_wstring(ft) + L" 个文件",
+                DlSubRect(page, 24, 220, 656, 18), *F.sub, C(Theme::Muted),
+                StringAlignmentCenter);
+        DrawStr(gr, HumanSize(bd) + L" / " + HumanSize(bt),
+                DlSubRect(page, 24, 238, 656, 18), *F.sub, C(Theme::Dim),
+                StringAlignmentCenter);
+
+        std::wstring cur;
+        EnterCriticalSection(&g_dlLock);
+        cur = FileNameOf(g_dlCur);
+        LeaveCriticalSection(&g_dlLock);
+        DrawStr(gr, cur, DlSubRect(page, 24, 264, 656, 18), *F.log, C(Theme::Dim),
+                StringAlignmentCenter, true);
+    } else {
+        // ---------------- 选择 / 完成 / 失败 ----------------
+        for (int i = 0; i < 3; ++i) {
+            static const wchar_t* names[3] = { L"正式版", L"快照", L"全部" };
+            RectF r = DlFilterRect(page, i);
+            const bool act = (g_app.dlFilter == i);
+            FillRound(gr, r, SR(9), C(act ? Theme::PillBg : Theme::Field));
+            StrokeRound(gr, r, SR(9), C(act ? Theme::PillBorder : Theme::Border),
+                        SR(act ? 1.3f : 1.0f));
+            DrawStr(gr, names[i], r, *F.sub, C(act ? Theme::PillText : Theme::Muted),
+                    StringAlignmentCenter);
+        }
+
+        RectF lr = DlListRect(page);
+        FillRound(gr, lr, SR(12), C(Theme::Field));
+        StrokeRound(gr, lr, SR(12), C(Theme::Border), SR(1));
+
+        GraphicsPath clip;
+        AddRoundRect(clip, lr, SR(12));
+        gr.SetClip(&clip);
+        if (g_dlView.empty()) {
+            DrawStr(gr, g_app.dlPhase == 0 ? L"正在获取版本列表…" : L"没有可下载的版本",
+                    lr, *F.sub, C(Theme::Dim), StringAlignmentCenter);
+        }
+        for (int i = 0; i < DL_ROWS; ++i) {
+            const int vi = g_app.dlScroll + i;
+            if (vi >= (int)g_dlView.size()) break;
+            const DlVersion& v = g_dlList[(size_t)g_dlView[(size_t)vi]];
+            RectF r = DlRowRect(page, i);
+            const bool sel = (vi == g_app.dlSel);
+            if (sel || g_app.dlHover == vi)
+                FillRound(gr, r, SR(8), C(sel ? RGB(0xE7, 0xF5, 0xEC) : RGB(0xEA, 0xF0, 0xF9)));
+
+            DrawStr(gr, v.id, RectF(r.X + SR(12), r.Y, r.Width - SR(190), r.Height), *F.sub,
+                    C(sel ? Theme::Accent : Theme::Text), StringAlignmentNear, true);
+            DrawStr(gr, v.date, RectF(r.X + r.Width - SR(196), r.Y, SR(104), r.Height), *F.log,
+                    C(Theme::Dim), StringAlignmentFar);
+
+            const bool rel = (v.type == L"release");
+            RectF tag(r.X + r.Width - SR(84), r.Y + SR(7), SR(72), SR(18));
+            FillRound(gr, tag, SR(9), C(rel ? RGB(0xE7, 0xF5, 0xEC) : Theme::PillBg));
+            DrawStr(gr, DlTypeName(v.type), tag, *F.log,
+                    C(rel ? Theme::Accent : Theme::PillText), StringAlignmentCenter);
+        }
+        gr.ResetClip();
+    }
+
+    // 分隔线
+    {
+        Pen line(C(Theme::PanelBorder), SR(1));
+        gr.DrawLine(&line, page.X + SR(24), page.Y + SR(304),
+                    page.X + page.Width - SR(24), page.Y + SR(304));
+    }
+
+    // 状态文字
+    std::wstring status;
+    Color statusCol = C(Theme::Muted);
+    if (g_app.dlPhase == 0)      status = L"正在获取版本列表…";
+    else if (g_app.dlPhase == 1) status = L"共 " + std::to_wstring(g_dlView.size()) + L" 个版本 · 滚轮翻页";
+    else if (g_app.dlPhase == 2) status = L"正在下载 · 切到别的页面也会继续";
+    else if (g_app.dlPhase == 3) status = L"下载完成，已加入版本列表";
+    else {
+        EnterCriticalSection(&g_dlLock);
+        status = g_dlErr.empty() ? std::wstring(L"下载失败") : g_dlErr;
+        LeaveCriticalSection(&g_dlLock);
+        statusCol = C(Theme::Danger);
+    }
+    DrawStr(gr, status, DlSubRect(page, 24, 316, 420, 18), *F.log, statusCol);
+
+    // 按钮
+    if (running) {
+        RectF cc = DlCancelRect(page);
+        FillRound(gr, cc, SR(9), C(Theme::Field));
+        StrokeRound(gr, cc, SR(9), C(Theme::Border), SR(1));
+        DrawStr(gr, L"取消", cc, *F.sub, C(Theme::Muted), StringAlignmentCenter);
+    } else {
+        RectF go = DlGoRect(page);
+        const bool canGo = (g_app.dlPhase == 1);
+        FillRound(gr, go, SR(9), C(canGo ? Theme::Accent : Theme::Field));
+        if (!canGo) StrokeRound(gr, go, SR(9), C(Theme::Border), SR(1));
+        DrawStr(gr, canGo ? L"开始下载" : L"返回列表", go, *F.sub,
+                C(canGo ? Theme::OnAccent : Theme::Muted), StringAlignmentCenter);
+    }
+}
+
+static void HandleDlClick(int x, int y) {
+    RectF page = DlPageRect();
+    if (!InRect(page, x, y)) return;                                  // 页面外的事件不归这里管
+
+    if (InRect(DlGoRect(page), x, y)) {
+        if (g_app.dlPhase == 1) StartDlDownload();
+        else if (g_app.dlPhase == 3 || g_app.dlPhase == 4) {
+            g_app.dlPhase = 1;
+            InvalidateRect(g_app.hwnd, nullptr, FALSE);
+        }
+        return;
+    }
+    if (g_app.dlPhase == 2 && InRect(DlCancelRect(page), x, y)) {
+        g_dlCancel.store(true);
+        EnterCriticalSection(&g_dlLock);
+        g_dlErr = L"已取消下载";
+        LeaveCriticalSection(&g_dlLock);
+        g_app.dlPhase = 4;
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
+        return;
+    }
+    if (g_app.dlPhase != 1) return;
+
+    for (int i = 0; i < 3; ++i) {
+        if (InRect(DlFilterRect(page, i), x, y)) {
+            if (g_app.dlFilter != i) {
+                g_app.dlFilter = i;
+                g_app.dlSel    = 0;
+                g_app.dlScroll = 0;
+                RebuildDlView();
+            }
+            InvalidateRect(g_app.hwnd, nullptr, FALSE);
+            return;
+        }
+    }
+
+    const int row = DlRowAt(page, x, y);
+    if (row >= 0) {
+        g_app.dlSel = row;                             // 单击只选中，开始按右侧按钮
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
+    }
+}
+
 static void DrawFieldBox(Graphics& gr, const RectF& r, bool focused) {
     FillRound(gr, r, SR(10), C(Theme::Field));
     StrokeRound(gr, r, SR(10), C(focused ? Theme::AccentSoft : Theme::Border), SR(focused ? 1.4f : 1.0f));
@@ -1944,6 +2746,247 @@ static void AnimMsDialog(bool open) {
     if (g_app.hwnd) InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
+static const wchar_t* kAppVersion = L"0.2.0";   // 与 res/app.rc 的版本资源保持一致
+
+// 标题下方的三个标签：开始 / 下载 / 设置
+static const wchar_t* kTabName[3] = { L"开始", L"下载", L"设置" };
+
+static void DrawTabs(Graphics& gr, const Layout& L) {
+    for (int i = 0; i < 3; ++i) {
+        const RectF r   = L.tab[i];
+        const bool  act = (g_app.page == i);
+        const bool  hov = (g_app.hover == HIT_TAB0 + i);
+        DrawStr(gr, kTabName[i], r, *F.sub,
+                C(act ? Theme::Text : (hov ? Theme::Muted : Theme::Dim)), StringAlignmentCenter);
+        if (act) {
+            REAL tw = MeasureW(gr, kTabName[i], *F.sub);
+            FillRound(gr, RectF(r.X + (r.Width - tw) / 2, r.Y + r.Height - SR(5), tw, SR(2.5f)),
+                      SR(1.4f), C(Theme::Accent));
+        }
+    }
+    Pen line(C(Theme::PanelBorder), SR(1));
+    gr.DrawLine(&line, L.panel1.X, SR(98), L.panel1.X + L.panel1.Width, SR(98));
+}
+
+// 小按钮（设置页的「浏览…／选择…」）
+static void DrawSmallBtn(Graphics& gr, const RectF& r, const std::wstring& text, bool hover) {
+    FillRound(gr, r, SR(9), C(hover ? Theme::FieldHover : Theme::Track));
+    StrokeRound(gr, r, SR(9), C(Theme::Border), SR(1));
+    DrawStr(gr, text, r, *F.sub, C(hover ? Theme::Text : Theme::Muted),
+            StringAlignmentCenter, false, true);
+}
+
+// ---------------- 开始页 ----------------
+static void DrawStartPage(Graphics& gr, const Layout& L) {
+    FillRound(gr, L.panel1, SR(14), C(Theme::Panel));
+    StrokeRound(gr, L.panel1, SR(14), C(Theme::PanelBorder), SR(1));
+
+    DrawStr(gr, L"玩家昵称", RectF(S(54), S(122), S(240), S(18)), *F.label, C(Theme::Muted));
+    DrawStr(gr, L"游戏版本", RectF(S(378), S(122), S(200), S(18)), *F.label, C(Theme::Muted));
+
+    // 昵称输入框
+    DrawFieldBox(gr, L.userBox, g_app.focus == FOCUS_USER);
+    {
+        RectF tr(L.userBox.X + SR(14), L.userBox.Y, L.userBox.Width - SR(28), L.userBox.Height);
+        DrawStr(gr, g_app.username, tr, *F.input, C(Theme::Text), StringAlignmentNear, false, true);
+        if (g_app.focus == FOCUS_USER && g_app.caretOn && g_ms.state != MS_LOGGED_IN) {
+            REAL w  = MeasureW(gr, g_app.username, *F.input);
+            REAL cx = tr.X + w + SR(1);
+            REAL cy = L.userBox.Y + L.userBox.Height / 2;
+            Pen caretp(C(Theme::Accent), SR(1.6f));
+            gr.DrawLine(&caretp, cx, cy - SR(9), cx, cy + SR(9));
+        }
+    }
+
+    // 账号方式：离线登录 / 微软登录（默认离线）
+    DrawAuthRow(gr, L);
+
+    // 版本下拉框
+    DrawFieldBox(gr, L.verBox, g_app.ddOpen);
+    {
+        std::wstring ver = g_app.versions.empty() ? L"(无可用版本)"
+                                                  : g_app.versions[(size_t)g_app.versionIdx];
+        DrawStr(gr, ver, RectF(L.verBox.X + SR(14), L.verBox.Y,
+                               L.verBox.Width - SR(52), L.verBox.Height),
+                *F.input, C(Theme::Text), StringAlignmentNear, true, true);
+        REAL cx = L.verBox.X + L.verBox.Width - SR(24);
+        REAL cy = L.verBox.Y + L.verBox.Height / 2;
+        Pen p(C(g_app.ddOpen ? Theme::Accent : Theme::Muted), SR(1.5f));
+        p.SetStartCap(LineCapRound);
+        p.SetEndCap(LineCapRound);
+        gr.DrawLine(&p, cx - SR(5), cy - SR(2), cx, cy + SR(3));
+        gr.DrawLine(&p, cx + SR(5), cy - SR(2), cx, cy + SR(3));
+    }
+
+    // ---------------- 启动按钮 ----------------
+    {
+        RectF b = L.launchBtn;
+        if (g_app.launching) {
+            FillRound(gr, b, SR(13), C(RGB(0xE8, 0xF2, 0xEC)));
+            GraphicsPath pth;
+            AddRoundRect(pth, b, SR(13));
+            gr.SetClip(&pth);
+            REAL w = b.Width * (g_app.progress / 100.0f);
+            if (w > SR(4)) FillRound(gr, RectF(b.X, b.Y, w, b.Height), SR(13), C(RGB(0x3F, 0xBF, 0x7C)));
+            gr.ResetClip();
+            StrokeRound(gr, b, SR(13), Color(90, 36, 168, 98), SR(1));
+        } else {
+            DWORD base  = g_app.launched ? RGB(0x2E, 0x9E, 0x62)
+                        : (g_app.hover == HIT_LAUNCH ? RGB(0x3F, 0xCC, 0x80) : RGB(0x2F, 0xB8, 0x6C));
+            DWORD base2 = g_app.launched ? RGB(0x1D, 0x84, 0x4E) : RGB(0x24, 0x9E, 0x5A);
+            LinearGradientBrush lg(b, C(base), C(base2), LinearGradientModeVertical);
+            GraphicsPath pth;
+            AddRoundRect(pth, b, SR(13));
+            gr.FillPath(&lg, &pth);
+        }
+
+        std::wstring text = g_app.launching
+            ? (L"正在启动 " + std::to_wstring((int)g_app.progress) + L"%")
+            : (g_app.launched ? L"游戏已启动" : L"启动游戏");
+        Color tc = g_app.launching ? C(Theme::Text) : C(Theme::OnAccent);
+
+        REAL tw    = MeasureW(gr, text, *F.btn);
+        REAL iconW = g_app.launching ? 0.0f : SR(23);
+        REAL startX = b.X + (b.Width - (tw + iconW)) / 2;
+        REAL cy     = b.Y + b.Height / 2;
+
+        if (!g_app.launching) {
+            PointF triPts[3] = {
+                PointF(startX, cy - SR(6)),
+                PointF(startX + SR(11), cy),
+                PointF(startX, cy + SR(6))
+            };
+            GraphicsPath tri;
+            tri.AddPolygon(triPts, 3);
+            SolidBrush tb(tc);
+            gr.FillPath(&tb, &tri);
+        }
+        DrawStr(gr, text, RectF(startX + iconW, b.Y, tw + SR(6), b.Height), *F.btn, tc,
+                StringAlignmentNear, false, true);
+    }
+
+    // ---------------- 日志 ----------------
+    {
+        RectF lp(L.logArea.X, L.logArea.Y - SR(6), L.logArea.Width, L.logArea.Height + SR(6));
+        FillRound(gr, lp, SR(12), C(Theme::Panel));
+        StrokeRound(gr, lp, SR(12), C(Theme::PanelBorder), SR(1));
+    }
+    for (size_t i = 0; i < g_app.logs.size(); ++i) {
+        bool last = (i + 1 == g_app.logs.size());
+        DrawStr(gr, L"› " + g_app.logs[i],
+                RectF(L.logArea.X + SR(16), L.logArea.Y + SR(2) + (REAL)i * SR(18),
+                      L.logArea.Width - SR(32), SR(18)),
+                *F.log, C(last ? Theme::Muted : Theme::Dim), StringAlignmentNear, true);
+    }
+}
+
+// ---------------- 设置页 ----------------
+static void DrawSettingsPage(Graphics& gr, const Layout& L) {
+    // 游戏目录
+    FillRound(gr, L.dirPanel, SR(14), C(Theme::Panel));
+    StrokeRound(gr, L.dirPanel, SR(14), C(Theme::PanelBorder), SR(1));
+    DrawStr(gr, L"游戏目录", RectF(S(52), S(116), S(200), S(16)), *F.label, C(Theme::Muted));
+    {
+        const bool ok = PathExists(g_app.gameDir);
+        DrawStr(gr, ok ? g_app.gameDir
+                       : std::wstring(L"未找到 .minecraft，点右侧「浏览…」选择"),
+                RectF(S(52), S(136), S(560), S(20)), *F.sub,
+                C(ok ? Theme::Muted : Theme::Dim), StringAlignmentNear, true);
+    }
+    DrawSmallBtn(gr, L.browseBtn, L"浏览…", g_app.hover == HIT_BROWSE);
+
+    // Java 路径
+    FillRound(gr, L.javaPanel, SR(14), C(Theme::Panel));
+    StrokeRound(gr, L.javaPanel, SR(14), C(Theme::PanelBorder), SR(1));
+    DrawStr(gr, L"Java 路径", RectF(S(52), S(192), S(200), S(16)), *F.label, C(Theme::Muted));
+    {
+        const bool ok = PathExists(g_app.javaPath);
+        DrawStr(gr, ok ? g_app.javaPath
+                       : std::wstring(L"未检测到 Java，点右侧「选择…」指定"),
+                RectF(S(52), S(212), S(560), S(20)), *F.sub,
+                C(ok ? Theme::Muted : Theme::Dim), StringAlignmentNear, true);
+    }
+    DrawSmallBtn(gr, L.javaBtn, L"选择…", g_app.hover == HIT_JAVA);
+
+    // 内存分配
+    FillRound(gr, L.memPanel, SR(14), C(Theme::Panel));
+    StrokeRound(gr, L.memPanel, SR(14), C(Theme::PanelBorder), SR(1));
+    DrawStr(gr, L"内存分配", RectF(S(54), S(268), S(240), S(18)), *F.label, C(Theme::Muted));
+    DrawStr(gr, std::to_wstring(g_app.memGb) + L" GB", RectF(S(52), S(266), S(656), S(20)),
+            *F.value, C(Theme::Accent), StringAlignmentFar);
+
+    FillRound(gr, L.sliderTrack, SR(3), C(Theme::Track));
+    {
+        float t  = (float)(g_app.memGb - 1) / 15.0f;
+        REAL  kx = L.sliderTrack.X + t * L.sliderTrack.Width;
+        REAL  cy = L.sliderTrack.Y + L.sliderTrack.Height / 2;
+        REAL  fw = kx - L.sliderTrack.X;
+        if (fw < SR(3)) fw = SR(3);
+        FillRound(gr, RectF(L.sliderTrack.X, L.sliderTrack.Y, fw, L.sliderTrack.Height),
+                  SR(3), C(Theme::Accent));
+        SolidBrush white(C(RGB(0xFF, 0xFF, 0xFF)));
+        gr.FillEllipse(&white, kx - SR(8.5f), cy - SR(8.5f), SR(17), SR(17));
+        Pen ring(C(Theme::AccentSoft), SR(1.4f));
+        gr.DrawEllipse(&ring, kx - SR(8.5f), cy - SR(8.5f), SR(17), SR(17));
+    }
+
+    // 附加 JVM 参数
+    FillRound(gr, L.argPanel, SR(14), C(Theme::Panel));
+    StrokeRound(gr, L.argPanel, SR(14), C(Theme::PanelBorder), SR(1));
+    DrawStr(gr, L"附加 JVM 参数", RectF(S(52), S(346), S(200), S(16)), *F.label, C(Theme::Muted));
+    DrawStr(gr, L"原样追加到 java 命令行，留空则不追加",
+            RectF(S(160), S(346), S(500), S(16)), *F.log, C(Theme::Dim));
+
+    DrawFieldBox(gr, L.argBox, g_app.focus == FOCUS_ARGS);
+    {
+        RectF tr(L.argBox.X + SR(12), L.argBox.Y, L.argBox.Width - SR(24), L.argBox.Height);
+        if (g_app.jvmArgs.empty() && g_app.focus != FOCUS_ARGS) {
+            DrawStr(gr, L"例如 -XX:+UseG1GC -Dfile.encoding=UTF-8", tr, *F.sub,
+                    C(Theme::Dim), StringAlignmentNear, true);
+        } else {
+            DrawStr(gr, g_app.jvmArgs, tr, *F.sub, C(Theme::Text), StringAlignmentNear, true);
+            if (g_app.focus == FOCUS_ARGS && g_app.caretOn) {
+                REAL w  = MeasureW(gr, g_app.jvmArgs, *F.sub);
+                REAL cx = tr.X + w + SR(1);
+                REAL cy = L.argBox.Y + L.argBox.Height / 2;
+                Pen caretp(C(Theme::Accent), SR(1.6f));
+                gr.DrawLine(&caretp, cx, cy - SR(8), cx, cy + SR(8));
+            }
+        }
+    }
+
+    // 关于
+    DrawStr(gr, L"Dream Minecraft Launcher · v" + std::wstring(kAppVersion) +
+                L" · MIT License © 2026 Dadi",
+            RectF(S(52), S(414), S(656), S(18)), *F.sub, C(Theme::Muted));
+    // 显示 %APPDATA% 字面量而不是展开后的真实路径：既不把当前 Windows 用户名画进截图，
+    // 对用户来说也比一长串 C:\Users\... 更好认
+    DrawStr(gr, L"配置：%APPDATA%\\DreamMinecraftLauncher\\config.ini",
+            RectF(S(52), S(434), S(656), S(18)), *F.log, C(Theme::Dim),
+            StringAlignmentNear, true);
+}
+
+// ---- 选 java.exe（设置页） ----
+static void ChooseJava() {
+    wchar_t buf[MAX_PATH] = {0};
+    if (!g_app.javaPath.empty())
+        wcsncpy(buf, g_app.javaPath.c_str(), MAX_PATH - 1);
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = g_app.hwnd;
+    ofn.lpstrFilter = L"Java 可执行文件\0java.exe;javaw.exe\0所有文件\0*.*\0";
+    ofn.lpstrFile   = buf;
+    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrTitle  = L"选择 java.exe";
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return;
+    g_app.javaPath = buf;
+    PushLog(L"Java: " + g_app.javaPath);
+    SaveConfig();
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
 static void Paint(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
@@ -1977,142 +3020,15 @@ static void Paint(HWND hwnd) {
                 *F.title, C(Theme::Text));
         DrawWindowButtons(gr, L);
 
-        // ---------------- 卡片一：账户 / 版本 / 内存 ----------------
-        FillRound(gr, L.panel1, SR(14), C(Theme::Panel));
-        StrokeRound(gr, L.panel1, SR(14), C(Theme::PanelBorder), SR(1));
+        // ---------------- 标签页 ----------------
+        DrawTabs(gr, L);
 
-        DrawStr(gr, L"玩家昵称", RectF(S(54), S(100), S(240), S(18)), *F.label, C(Theme::Muted));
-        DrawStr(gr, L"游戏版本", RectF(S(378), S(100), S(240), S(18)), *F.label, C(Theme::Muted));
+        if (g_app.page == 0)      DrawStartPage(gr, L);
+        else if (g_app.page == 1) DrawDlPage(gr);
+        else                      DrawSettingsPage(gr, L);
 
-        // 昵称输入框
-        DrawFieldBox(gr, L.userBox, g_app.focus == FOCUS_USER);
-        {
-            RectF tr(L.userBox.X + SR(14), L.userBox.Y, L.userBox.Width - SR(28), L.userBox.Height);
-            DrawStr(gr, g_app.username, tr, *F.input, C(Theme::Text), StringAlignmentNear, false, true);
-            if (g_app.focus == FOCUS_USER && g_app.caretOn && g_ms.state != MS_LOGGED_IN) {
-                REAL w  = MeasureW(gr, g_app.username, *F.input);
-                REAL cx = tr.X + w + SR(1);
-                REAL cy = L.userBox.Y + L.userBox.Height / 2;
-                Pen caretp(C(Theme::Accent), SR(1.6f));
-                gr.DrawLine(&caretp, cx, cy - SR(9), cx, cy + SR(9));
-            }
-        }
-
-        // 账号方式：离线登录 / 微软登录（默认离线）
-        DrawAuthRow(gr, L);
-
-        // 版本下拉框
-        DrawFieldBox(gr, L.verBox, g_app.ddOpen);
-        {
-            std::wstring ver = g_app.versions.empty() ? L"(无可用版本)"
-                                                      : g_app.versions[(size_t)g_app.versionIdx];
-            DrawStr(gr, ver, RectF(L.verBox.X + SR(14), L.verBox.Y,
-                                   L.verBox.Width - SR(52), L.verBox.Height),
-                    *F.input, C(Theme::Text), StringAlignmentNear, true, true);
-            REAL cx = L.verBox.X + L.verBox.Width - SR(24);
-            REAL cy = L.verBox.Y + L.verBox.Height / 2;
-            Pen p(C(g_app.ddOpen ? Theme::Accent : Theme::Muted), SR(1.5f));
-            p.SetStartCap(LineCapRound);
-            p.SetEndCap(LineCapRound);
-            gr.DrawLine(&p, cx - SR(5), cy - SR(2), cx, cy + SR(3));
-            gr.DrawLine(&p, cx + SR(5), cy - SR(2), cx, cy + SR(3));
-        }
-
-        // 内存滑块
-        DrawStr(gr, L"内存分配", RectF(S(54), S(200), S(240), S(18)), *F.label, C(Theme::Muted));
-        DrawStr(gr, std::to_wstring(g_app.memGb) + L" GB", RectF(S(52), S(198), S(656), S(20)),
-                *F.value, C(Theme::Accent), StringAlignmentFar);
-
-        FillRound(gr, L.sliderTrack, SR(3), C(Theme::Track));
-        {
-            float t  = (float)(g_app.memGb - 1) / 15.0f;
-            REAL  kx = L.sliderTrack.X + t * L.sliderTrack.Width;
-            REAL  cy = L.sliderTrack.Y + L.sliderTrack.Height / 2;
-            REAL  fw = kx - L.sliderTrack.X;
-            if (fw < SR(3)) fw = SR(3);
-            FillRound(gr, RectF(L.sliderTrack.X, L.sliderTrack.Y, fw, L.sliderTrack.Height),
-                      SR(3), C(Theme::Accent));
-            SolidBrush white(C(RGB(0xFF, 0xFF, 0xFF)));
-            gr.FillEllipse(&white, kx - SR(8.5f), cy - SR(8.5f), SR(17), SR(17));
-            Pen ring(C(Theme::AccentSoft), SR(1.4f));
-            gr.DrawEllipse(&ring, kx - SR(8.5f), cy - SR(8.5f), SR(17), SR(17));
-        }
-
-        // ---------------- 卡片二：游戏目录 ----------------
-        FillRound(gr, L.panel2, SR(14), C(Theme::Panel));
-        StrokeRound(gr, L.panel2, SR(14), C(Theme::PanelBorder), SR(1));
-        DrawStr(gr, L"游戏目录", RectF(S(52), S(272), S(200), S(16)), *F.label, C(Theme::Muted));
-        {
-            bool ok = PathExists(g_app.gameDir);
-            std::wstring path = ok ? g_app.gameDir : L"未找到 .minecraft，点击右侧「浏览…」选择";
-            DrawStr(gr, path, RectF(S(52), S(290), S(560), S(20)), *F.sub,
-                    C(ok ? Theme::Muted : Theme::Dim), StringAlignmentNear, true);
-        }
-        {
-            bool hov = (g_app.hover == HIT_BROWSE);
-            FillRound(gr, L.browseBtn, SR(9), C(hov ? Theme::FieldHover : Theme::Track));
-            StrokeRound(gr, L.browseBtn, SR(9), C(Theme::Border), SR(1));
-            DrawStr(gr, L"浏览…", L.browseBtn, *F.sub, C(hov ? Theme::Text : Theme::Muted),
-                    StringAlignmentCenter, false, true);
-        }
-
-        // ---------------- 启动按钮 ----------------
-        {
-            RectF b = L.launchBtn;
-            if (g_app.launching) {
-                FillRound(gr, b, SR(13), C(RGB(0xE8, 0xF2, 0xEC)));
-                GraphicsPath pth;
-                AddRoundRect(pth, b, SR(13));
-                gr.SetClip(&pth);
-                REAL w = b.Width * (g_app.progress / 100.0f);
-                if (w > SR(4)) FillRound(gr, RectF(b.X, b.Y, w, b.Height), SR(13), C(RGB(0x3F, 0xBF, 0x7C)));
-                gr.ResetClip();
-                StrokeRound(gr, b, SR(13), Color(90, 36, 168, 98), SR(1));
-            } else {
-                DWORD base  = g_app.launched ? RGB(0x2E, 0x9E, 0x62)
-                            : (g_app.hover == HIT_LAUNCH ? RGB(0x3F, 0xCC, 0x80) : RGB(0x2F, 0xB8, 0x6C));
-                DWORD base2 = g_app.launched ? RGB(0x1D, 0x84, 0x4E) : RGB(0x24, 0x9E, 0x5A);
-                LinearGradientBrush lg(b, C(base), C(base2), LinearGradientModeVertical);
-                GraphicsPath pth;
-                AddRoundRect(pth, b, SR(13));
-                gr.FillPath(&lg, &pth);
-            }
-
-            std::wstring text = g_app.launching
-                ? (L"正在启动 " + std::to_wstring((int)g_app.progress) + L"%")
-                : (g_app.launched ? L"游戏已启动" : L"启动游戏");
-            Color tc = g_app.launching ? C(Theme::Text) : C(Theme::OnAccent);
-
-            REAL tw    = MeasureW(gr, text, *F.btn);
-            REAL iconW = g_app.launching ? 0.0f : SR(23);
-            REAL startX = b.X + (b.Width - (tw + iconW)) / 2;
-            REAL cy     = b.Y + b.Height / 2;
-
-            if (!g_app.launching) {
-                PointF triPts[3] = {
-                    PointF(startX, cy - SR(6)),
-                    PointF(startX + SR(11), cy),
-                    PointF(startX, cy + SR(6))
-                };
-                GraphicsPath tri;
-                tri.AddPolygon(triPts, 3);
-                SolidBrush tb(tc);
-                gr.FillPath(&tb, &tri);
-            }
-            DrawStr(gr, text, RectF(startX + iconW, b.Y, tw + SR(6), b.Height), *F.btn, tc,
-                    StringAlignmentNear, false, true);
-        }
-
-        // ---------------- 日志 ----------------
-        for (size_t i = 0; i < g_app.logs.size(); ++i) {
-            bool last = (i + 1 == g_app.logs.size());
-            DrawStr(gr, L"› " + g_app.logs[i],
-                    RectF(L.logArea.X, L.logArea.Y + (REAL)i * SR(16), L.logArea.Width, SR(16)),
-                    *F.log, C(last ? Theme::Muted : Theme::Dim), StringAlignmentNear, true);
-        }
-
-        // ---------------- 下拉浮层（最后绘制，覆盖在上层） ----------------
-        if (g_app.ddOpen && !g_app.versions.empty()) {
+        // ---------------- 版本下拉浮层（仅开始页，覆盖在上层） ----------------
+        if (g_app.page == 0 && g_app.ddOpen && !g_app.versions.empty()) {
             int n    = (int)g_app.versions.size();
             int show = std::min(n, DD_MAX_SHOW);
             RectF panel(L.verBox.X, L.verBox.Y + L.verBox.Height + SR(6), L.verBox.Width,
@@ -2157,11 +3073,6 @@ static void Paint(HWND hwnd) {
 // ============================================================================
 //  命中测试 & 交互
 // ============================================================================
-static bool InRect(const RectF& r, int x, int y) {
-    return (REAL)x >= r.X && (REAL)x <= r.X + r.Width &&
-           (REAL)y >= r.Y && (REAL)y <= r.Y + r.Height;
-}
-
 static RectF DropdownPanel() {
     int show = std::min((int)g_app.versions.size(), DD_MAX_SHOW);
     Layout L = ComputeLayout();
@@ -2212,17 +3123,25 @@ static int HitTest(int x, int y) {
     Layout L = ComputeLayout();
     if (InRect(L.closeBtn, x, y))  return HIT_CLOSE;
     if (InRect(L.minBtn, x, y))    return HIT_MIN;
-    if (InRect(L.msOffBtn, x, y))  return HIT_MS_OFF;
-    if (InRect(L.msOnBtn, x, y))   return HIT_MS_ON;
-    if (g_ms.state == MS_LOGGED_IN && InRect(L.msUnbind, x, y)) return HIT_MS_UNBIND;
-    if (InRect(L.userBox, x, y))   return HIT_USER;
-    if (InRect(L.verBox, x, y))    return HIT_VER;
-    if (InRect(L.browseBtn, x, y)) return HIT_BROWSE;
-    if (InRect(L.launchBtn, x, y)) return HIT_LAUNCH;
-    RectF track = L.sliderTrack;
-    track.Y -= SR(10);
-    track.Height += SR(20);
-    if (InRect(track, x, y))       return HIT_SLIDER;
+    for (int i = 0; i < 3; ++i)
+        if (InRect(L.tab[i], x, y)) return HIT_TAB0 + i;
+
+    if (g_app.page == 0) {
+        if (InRect(L.msOffBtn, x, y))  return HIT_MS_OFF;
+        if (InRect(L.msOnBtn, x, y))   return HIT_MS_ON;
+        if (g_ms.state == MS_LOGGED_IN && InRect(L.msUnbind, x, y)) return HIT_MS_UNBIND;
+        if (InRect(L.userBox, x, y))   return HIT_USER;
+        if (InRect(L.verBox, x, y))    return HIT_VER;
+        if (InRect(L.launchBtn, x, y)) return HIT_LAUNCH;
+    } else if (g_app.page == 2) {
+        if (InRect(L.browseBtn, x, y)) return HIT_BROWSE;
+        if (InRect(L.javaBtn, x, y))   return HIT_JAVA;
+        if (InRect(L.argBox, x, y))    return HIT_ARGS;
+        RectF track = L.sliderTrack;
+        track.Y -= SR(10);
+        track.Height += SR(20);
+        if (InRect(track, x, y))       return HIT_SLIDER;
+    }
     return HIT_NONE;
 }
 
@@ -2353,16 +3272,50 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_APP_DL: {
+        if (wParam == 1) {                       // 版本列表就绪
+            if (!g_dlList.empty()) {
+                g_app.dlPhase  = 1;
+                g_app.dlSel    = 0;
+                g_app.dlScroll = 0;
+                RebuildDlView();
+            } else {
+                g_app.dlPhase = 4;
+            }
+        } else if (wParam == 2) {                // 下载完成
+            g_app.dlPhase = 3;
+            if (g_app.gameDir.empty()) g_app.gameDir = AppDataMinecraftDir();
+            auto vs = ScanVersions(g_app.gameDir);
+            if (!vs.empty()) {
+                g_app.versions = vs;
+                g_app.realScan = true;
+                g_app.versionIdx = 0;
+                for (size_t i = 0; i < vs.size(); ++i)
+                    if (vs[i] == g_app.dlTarget) { g_app.versionIdx = (int)i; break; }
+            }
+            PushLog(L"下载完成 · " + g_app.dlTarget);
+            SaveConfig();
+        } else {                                 // 失败 / 取消
+            g_app.dlPhase = 4;
+            EnterCriticalSection(&g_dlLock);
+            const std::wstring why = g_dlErr;
+            LeaveCriticalSection(&g_dlLock);
+            PushLog(L"下载未完成：" + (why.empty() ? std::wstring(L"未知原因") : why));
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+
     case WM_TIMER: {
         if (wParam == 2) {                       // 弹窗动画（15ms 一帧，160ms 跑完）
             const float dt = 0.015f / 0.16f;
-            const float target = g_app.msDlg ? 1.0f : 0.0f;
-            if (g_app.msAnim < target)      g_app.msAnim = std::min(target, g_app.msAnim + dt);
-            else if (g_app.msAnim > target) g_app.msAnim = std::max(target, g_app.msAnim - dt);
-            if (std::fabs(g_app.msAnim - target) < 0.001f) {
-                g_app.msAnim = target;
-                KillTimer(hwnd, 2);
-            }
+            const float t1 = g_app.msDlg ? 1.0f : 0.0f;
+            if (g_app.msAnim < t1)      g_app.msAnim = std::min(t1, g_app.msAnim + dt);
+            else if (g_app.msAnim > t1) g_app.msAnim = std::max(t1, g_app.msAnim - dt);
+
+            const bool d1 = std::fabs(g_app.msAnim - t1) < 0.001f;
+            if (d1) g_app.msAnim = t1;
+            if (d1) KillTimer(hwnd, 2);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -2426,6 +3379,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
 
+        if (g_app.page == 1) {                   // 下载页：列表行 hover + 手型光标
+            RectF page = DlPageRect();
+            const int r = (g_app.dlPhase == 1) ? DlRowAt(page, x, y) : -1;
+            if (r != g_app.dlHover) {
+                g_app.dlHover = r;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            bool hand = (r >= 0) || InRect(DlGoRect(page), x, y) ||
+                        (g_app.dlPhase == 2 && InRect(DlCancelRect(page), x, y));
+            if (!hand && g_app.dlPhase == 1) {
+                for (int i = 0; i < 3 && !hand; ++i)
+                    hand = InRect(DlFilterRect(page, i), x, y);
+            }
+            int hh = HitTest(x, y);              // 标签页按钮仍要能点
+            if (hh >= HIT_TAB0 && hh <= HIT_TAB2) hand = true;
+            SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
+            g_app.hover = hh;
+            return 0;
+        }
+
         if (g_app.draggingSlider) { SetSliderFromX(x); return 0; }
 
         int h = HitTest(x, y);
@@ -2436,10 +3409,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         LPCWSTR cur = IDC_ARROW;
         if (h == HIT_CLOSE || h == HIT_MIN || h == HIT_BROWSE || h == HIT_LAUNCH ||
-            h == HIT_VER || h == HIT_MS_OFF || h == HIT_MS_ON || h == HIT_MS_UNBIND)
+            h == HIT_VER || h == HIT_MS_OFF || h == HIT_MS_ON || h == HIT_MS_UNBIND ||
+            h == HIT_JAVA || (h >= HIT_TAB0 && h <= HIT_TAB2))
             cur = IDC_HAND;
         else if (h == HIT_USER)
             cur = (g_ms.state == MS_LOGGED_IN) ? IDC_ARROW : IDC_IBEAM;
+        else if (h == HIT_ARGS)
+            cur = IDC_IBEAM;
         else if (h == HIT_SLIDER)
             cur = IDC_SIZEWE;
         SetCursor(LoadCursorW(nullptr, cur));
@@ -2467,6 +3443,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
+        // 标签页在任何页面都能点
+        {
+            int t = HitTest(x, y);
+            if (t >= HIT_TAB0 && t <= HIT_TAB2) { SwitchPage(t - HIT_TAB0); return 0; }
+        }
+
+        if (g_app.page == 1) { HandleDlClick(x, y); return 0; }
+
         if (g_app.ddOpen) {                        // 浮层优先
             int di = DropdownItemAt(x, y);
             if (di >= 0) { g_app.versionIdx = di; SaveConfig(); }
@@ -2482,6 +3466,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case HIT_MS_OFF: SelectOffline(); return 0;
         case HIT_MS_ON:  SelectMs(); return 0;
         case HIT_MS_UNBIND: LogoutMs(); return 0;
+        case HIT_JAVA:   ChooseJava(); return 0;
+        case HIT_ARGS:
+            g_app.focus = FOCUS_ARGS; g_app.caretOn = true; g_app.caretTick = 0;
+            break;
         case HIT_USER:
             if (g_ms.state == MS_LOGGED_IN) return 0;      // 已登录时昵称由账号决定
             g_app.focus = FOCUS_USER; g_app.caretOn = true; g_app.caretTick = 0;
@@ -2511,6 +3499,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_MOUSEWHEEL: {
+        if (g_app.page == 1) {                   // 下载列表翻页
+            if (g_app.dlPhase == 1) {
+                const int maxScroll = std::max(0, (int)g_dlView.size() - DL_ROWS);
+                const int step = (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? -1 : 1;
+                g_app.dlScroll = std::max(0, std::min(maxScroll, g_app.dlScroll + step));
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
         if (!g_app.ddOpen) break;
         int delta     = GET_WHEEL_DELTA_WPARAM(wParam);
         int maxScroll = std::max(0, (int)g_app.versions.size() - DD_MAX_SHOW);
@@ -2532,16 +3529,57 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.caretOn = true;
             g_app.caretTick = 0;
             InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (g_app.focus == FOCUS_ARGS) {
+            wchar_t ch = (wchar_t)wParam;
+            if (ch == L'\b') {
+                if (!g_app.jvmArgs.empty()) g_app.jvmArgs.pop_back();
+            } else if (ch >= 32 && ch != 127) {
+                if (g_app.jvmArgs.size() < 160) g_app.jvmArgs.push_back(ch);
+            }
+            g_app.caretOn = true;
+            g_app.caretTick = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     }
 
     case WM_KEYDOWN:
+        if (g_app.page == 1) {
+            if (wParam == VK_ESCAPE) { SwitchPage(0); return 0; }
+            if (wParam == VK_RETURN) {
+                if (g_app.dlPhase == 1) StartDlDownload();
+                else if (g_app.dlPhase == 3 || g_app.dlPhase == 4) {
+                    g_app.dlPhase = 1;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+            if (g_app.dlPhase == 1 && (wParam == VK_UP || wParam == VK_DOWN)) {
+                const int n = (int)g_dlView.size();
+                if (n > 0) {
+                    g_app.dlSel += (wParam == VK_UP ? -1 : 1);
+                    g_app.dlSel = std::max(0, std::min(n - 1, g_app.dlSel));
+                    if (g_app.dlSel < g_app.dlScroll) g_app.dlScroll = g_app.dlSel;
+                    if (g_app.dlSel >= g_app.dlScroll + DL_ROWS)
+                        g_app.dlScroll = g_app.dlSel - DL_ROWS + 1;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+            return 0;
+        }
         if (g_app.msDlg) {
             if (wParam == VK_ESCAPE || wParam == VK_RETURN) {
                 AnimMsDialog(false);
                 return 0;
             }
+        }
+        // 正在编辑文本框时，Esc / Enter 只用来收起焦点，不触发启动
+        if (g_app.focus != FOCUS_NONE && (wParam == VK_ESCAPE || wParam == VK_RETURN)) {
+            g_app.focus = FOCUS_NONE;
+            SaveConfig();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
         }
         if (wParam == VK_ESCAPE) {
             if (g_app.ddOpen) { g_app.ddOpen = false; InvalidateRect(hwnd, nullptr, FALSE); }
@@ -2561,6 +3599,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DESTROY:
         KillTimer(hwnd, 1);
         KillTimer(hwnd, 2);
+        g_dlCancel.store(true);          // 让下载线程尽快收尾
         SaveConfig();
         PostQuitMessage(0);
         return 0;
@@ -2605,8 +3644,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         for (size_t i = 0; i < g_app.versions.size(); ++i)
             if (g_app.versions[i] == savedVer) { g_app.versionIdx = (int)i; break; }
     }
-    g_app.javaPath = DetectJava();
-
+    // 设置页里手动指定过的 java 优先，无效或没配过才自动探测
+    if (g_app.javaPath.empty() || !PathExists(g_app.javaPath)) g_app.javaPath = DetectJava();
     // ---- 建窗 ----
     // 图标取自内嵌的 dml.ico（多尺寸），按系统要求的大/小图标尺寸各取一张
     HICON hIconBig = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,

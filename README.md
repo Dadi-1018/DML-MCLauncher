@@ -6,47 +6,58 @@
 
 一个**纯 C++ / Win32 / GDI+** 编写的 Minecraft 启动器：无第三方 UI 库、无运行时依赖，
 编译产物只有一个 exe。界面为**浅色**（白底 + 浅蓝账号胶囊 + 草绿强调）、无边框圆角窗口，
-所有控件（输入框、下拉框、滑块、按钮、日志面板）均为手工绘制。
+所有控件（输入框、下拉框、滑块、按钮、日志面板）均为手工绘制。标题下方分三个标签页：
+**开始 / 下载 / 设置**。
 
 它**能真的把游戏启动起来**：自己解析 `version.json`（含 `inheritsFrom` 继承与 `rules` 过滤）、
 拼出完整 `java` 命令行、拉起进程并把游戏输出回灌到界面日志。账号支持**离线**与
-**微软账号（设备码授权）**两种模式，默认离线；不自动下载缺失的 libraries / assets
-（详见[真实启动](#真实启动)与[已知限制](#已知限制)）。
+**微软账号（设备码授权）**两种模式，默认离线；**没装的版本也能直接在启动器里下载**——
+走 BMCLAPI 镜像，一次把版本 JSON、客户端 jar、依赖库与全部资源对象拉全，下完即可启动
+（详见[真实启动](#真实启动)与[下载版本](#下载版本)）。
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ ▉ Dream Minecraft Launcher                       ─    ✕      │
+│   开始    下载    设置                                       │
 │ ┌──────────────────────────────────────────────────────────┐ │
-│ │ 玩家昵称              游戏版本                            │ │
+│ │ 玩家昵称              游戏版本                           │ │
 │ │ ┌──────────────┐     ┌────────────────────┐              │ │
-│ │ │ Steve        │     │ 1.20.4          ▾ │              │ │
+│ │ │ Steve        │     │ 1.20.4          ▾ │               │ │
 │ │ └──────────────┘     └────────────────────┘              │ │
 │ │ (离线登录) (微软登录)                                    │ │
-│ │ 内存分配                                           4 GB   │ │
-│ │ ●──────────────────────────────────────────────          │ │
 │ └──────────────────────────────────────────────────────────┘ │
 │ ┌──────────────────────────────────────────────────────────┐ │
-│ │ 游戏目录                                                  │ │
-│ │ C:\Users\xxx\AppData\Roaming\.minecraft     [ 浏览… ]     │ │
+│ │                  ▶  启 动 游 戏                          │ │
 │ └──────────────────────────────────────────────────────────┘ │
 │ ┌──────────────────────────────────────────────────────────┐ │
-│ │                  ▶  启 动 游 戏                           │ │
+│ │ › Java: C:\Program Files\Java\jdk-17\bin\java.exe        │ │
+│ │ › 游戏目录: ...\.minecraft                               │ │
+│ │ › 准备就绪，点击「启动游戏」                             │ │
 │ └──────────────────────────────────────────────────────────┘ │
-│ › Java: C:\Program Files\Java\jdk-17\bin\java.exe            │
-│ › 游戏目录: ...\.minecraft                                   │
-│ › 准备就绪，点击「启动游戏」                                  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
+三个标签页各管一摊：
+
+| 标签 | 内容 |
+|---|---|
+| **开始** | 玩家昵称、离线 / 微软登录、游戏版本、启动按钮、运行日志 |
+| **下载** | 从 BMCLAPI 镜像下载任意正式版 / 快照（详见[下载版本](#下载版本)） |
+| **设置** | 游戏目录、Java 路径、内存分配、附加 JVM 参数、关于 |
+
 ## 界面预览
 
-| 主界面 | 版本下拉 |
+| 开始页 | 版本下拉 |
 |---|---|
 | ![](docs/preview-idle.png) | ![](docs/preview-dropdown.png) |
 
 | 启动进度 | 启动完成 |
 |---|---|
 | ![](docs/preview-launching.png) | ![](docs/preview-done.png) |
+
+| 下载版本 | 下载进度 |
+|---|---|
+| ![](docs/preview-download.png) | ![](docs/preview-downloading.png) |
 
 > 截图中的日志首行（Java 路径）已做马赛克处理，避免暴露本机目录结构。
 
@@ -75,7 +86,7 @@
 
 ```
 MCLaucher/
-├─ src/main.cpp        # 全部源码（约 2700 行，单文件）
+├─ src/main.cpp        # 全部源码（约 3670 行，单文件）
 ├─ src/resource.h      # 资源 ID（app.rc 与 main.cpp 共用）
 ├─ res/app.rc          # 资源脚本：图标 + 页眉标志
 ├─ assets/logo/        # 标志源文件与生成脚本
@@ -137,19 +148,24 @@ cmake --build out --config Release
 
 | 模块 | 说明 |
 |---|---|
+| 标签页 | 标题下方「开始 / 下载 / 设置」三个标签，绿色下划线指示当前页；三个页面共用同一套自绘控件，切页不重建窗口 |
 | 无边框窗口 | `WS_POPUP` + `CreateRoundRectRgn` 圆角；顶部空白区拖动，自绘最小化/关闭按钮 |
 | 双缓冲绘制 | 内存 DC + `BitBlt`，`Graphics` 抗锯齿，窗口缩放/重绘不闪烁 |
 | 品牌资源 | 图标与页眉标志编进 exe（`res/app.rc`）；窗口、任务栏图标取自多尺寸 `dml.ico`，页眉用 GDI+ 高质量缩放绘制 PNG 标志 |
 | 自绘输入框 | 光标闪烁（`WM_CHAR` / 定时器）、退格、16 字符上限、聚焦高亮描边 |
 | 自绘下拉框 | 浮层绘制在主窗口之上、悬停高亮、滚轮翻页（>6 个版本时） |
 | 内存滑块 | 1–16 GB 拖动调节，按下即跟随鼠标并捕获输入 |
+| 附加 JVM 参数 | 设置页可填任意 JVM 参数（如 `-XX:+UseG1GC -Dfile.encoding=UTF-8`），**原样**拼在 `-Xmx/-Xms` 之后、版本自带 JVM 参数之前；存进 `config.ini` 的 `jvmargs=` |
 | 环境探测 | 扫描 `.minecraft\versions\*\*.json` 得到真实版本列表；`JAVA_HOME` 与常见安装目录探测 Java |
 | 目录选择 | `SHBrowseForFolder` 选择游戏目录，切换后自动重扫版本 |
+| 版本下载 | 「下载」标签页，数据取自 **BMCLAPI 镜像**：版本清单 → 版本 JSON → 客户端 jar → 依赖库（含 windows 分类器）→ 资源索引 → 全部资源对象，下完直接出现在版本下拉里 |
+| 并发与续传 | 16 路并发拉小文件；按字节数校验完整性，目标文件已存在且大小正确就跳过，中断后重按即续传 |
+| 下载页 | 正式版 / 快照 / 全部三档筛选、滚轮翻页、↑↓ 选择、回车即下；进度页显示百分比、文件数、字节数与当前文件 |
 | 账号登录 | 昵称框下方「离线登录 / 微软登录」两个胶囊（默认离线）；微软走设备码授权 → XBL → XSTS → Minecraft Services，成功后用**正版游戏 ID** 覆盖昵称，启动时注入真实 `accessToken` / `uuid` / `xuid` |
 | 令牌安全 | refresh token 经 DPAPI（`CryptProtectData`）加密后落盘，下次启动静默续期；access token 只留在内存 |
 | 验证码弹窗 | 码就绪即复制到剪贴板并弹出卡片（160ms ease-out 动画），倒计时 5 秒后自动唤起浏览器，点「重新打开浏览器」可立即打开 |
 | 浅色主题 | 白底深字 + 浅蓝账号胶囊 + 草绿强调，配色集中在 `Theme` 命名空间，改一处即可整体换肤 |
-| 配置持久化 | 退出/修改时写入 `%APPDATA%\DreamMinecraftLauncher\config.ini`（UTF-8） |
+| 配置持久化 | 退出/修改时写入 `%APPDATA%\DreamMinecraftLauncher\config.ini`（UTF-8），含 `username` / `version` / `memory` / `gamedir` / `java` / `jvmargs` |
 | 启动流程 | 5 个真实步骤（校验账户 → 读版本清单 → 查依赖 → 整理参数 → 拉起 Java），按钮内进度条 16ms 一帧平滑推进 |
 | 版本清单解析 | 自带极简 JSON 解析器；支持 `inheritsFrom` 继承链合并、`rules` 的 `os.name` / `os.arch` / `features` 过滤 |
 | 类路径与 natives | 按 maven 坐标还原 jar 路径，同 `group:artifact` 去重（子版本覆盖父版本）；natives jar 一并加入 `classpath`（LWJGL3 会自行从 jar 内解压原生库） |
@@ -159,8 +175,10 @@ cmake --build out --config Release
 
 ## 快捷键
 
-- `Enter` 启动游戏
-- `Esc` 关闭版本下拉浮层 / 验证码弹窗
+- `Enter` 启动游戏（下载页内 = 开始下载）
+- `Esc` 关闭版本下拉浮层 / 验证码弹窗；在下载页按 `Esc` 回到「开始」
+- 在昵称框或「附加 JVM 参数」里打字时，`Enter` / `Esc` 只收起焦点，不会触发启动
+- 下载页可用 `↑` `↓` 选择版本、滚轮翻页
 - 光标在昵称框内时可正常输入 / 退格
 
 ## 代码导读（`src/main.cpp`）
@@ -173,6 +191,11 @@ DrawStr         带对齐与省略号的文字绘制
 DrawLogo        页眉标志（内嵌 PNG 优先，缺失时回退手绘草方块）
 LoadLogoResource  从 RT_RCDATA 取出 PNG → IStream → GDI+ Image
 ComputeLayout   全部控件坐标集中在此，改界面只改这一个函数
+DrawTabs        标题下方的「开始 / 下载 / 设置」标签
+DrawStartPage   开始页：昵称 / 账号 / 版本 / 启动按钮 / 日志
+DrawSettingsPage 设置页：游戏目录 / Java 路径 / 内存滑块 / 关于
+ChooseJava      弹出文件对话框指定 java.exe（写回 config.ini）
+SwitchPage      切页（首次进下载页时去拉版本清单）
 AppState        全局状态（昵称、版本、内存、hover、下拉、启动进度）
 ScanVersions    扫描 .minecraft\versions
 DetectJava      探测 java.exe
@@ -191,7 +214,14 @@ MsLoginThread   设备码授权 → XBL → XSTS → Minecraft Services → 档�
 MsRefreshThread 用 DPAPI 解出来的 refresh token 静默续期
 DrawAuthPill    昵称框下方「离线登录 / 微软登录」浅蓝胶囊
 DrawMsDialog    验证码弹窗（scrim + 卡片滑入，ease-out 动画）
-Paint           绘制入口（先背景 → 卡片 → 控件 → 浮层 → 弹窗）
+--- 下载版本 ---
+DlManifestThread 拉取 BMCLAPI 版本清单（920+ 个版本）
+BuildDlPlan     版本 JSON + 客户端 jar + 依赖库 + 资源索引 + 资源对象，去重成任务表
+HttpDownload    流式下载到 .part → 原子改名，按 size 校验
+DlWorker        16 路并发工作线程：原子取任务、跳过已存在文件、累计字节
+DlThread        单个版本的下载总控（建计划 → 线程池 → 汇报 UI）
+DrawDlPage      下载页：筛选列表 / 进度面板 / 完成与失败
+Paint           绘制入口（背景 → 标签页 → 当前页 → 浮层 → 弹窗）
 WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动 / 启动进度
 ```
 
@@ -218,17 +248,45 @@ WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动 / 启动�
 
 还没做的（见下方「已知限制」）：
 
-1. **资源补全**：不下载缺失的 `libraries` / `assets`，如果版本没装全，
-   启动会直接报「缺少 N 个依赖文件」，请先用官方启动器把该版本装好。
+1. **资源补全**：启动时不会自动补齐缺失依赖；要补请到「下载」页装整版（见下节）。
 2. **natives 解压**：不自己解压 natives jar，而是把 natives jar 加进 `classpath`，
    由 LWJGL3 在加载时自行从 jar 内提取原生库。这套做法对 1.13+ 有效；
    更老的 LWJGL2 版本仍需真实解压到 `versions\<v>\natives`。
 
 建议把上述逻辑拆成独立的 `Launcher` 类，保持 UI 层只负责展示与交互。
 
+## 下载版本
+
+标题下方的第二个标签就是「下载」页，切过去即是版本列表：
+
+- **筛选**：正式版 / 快照 / 全部，默认正式版（约 103 个）
+- **选择**：滚轮翻页、`↑` `↓` 移动、单击选中；再点一次该行（或回车 /「开始下载」）开跑
+- **下载**：按下面的顺序拉，进度页显示百分比、文件数、字节数与当前文件
+
+| 顺序 | 内容 | 落点 |
+|---|---|---|
+| 1 | 版本 JSON | `.minecraft\versions\<id>\<id>.json` |
+| 2 | 客户端 jar | `.minecraft\versions\<id>\<id>.jar` |
+| 3 | 依赖库（artifact + windows 分类器） | `.minecraft\libraries\...` |
+| 4 | 资源索引 | `.minecraft\assets\indexes\<index>.json` |
+| 5 | 资源对象 | `.minecraft\assets\objects\<h2>\<hash>` |
+
+几个实现要点：
+
+- 请求全部打到 `https://bmclapi2.bangbang93.com`。版本 JSON 里仍是 Mojang 官方 URL，
+  由 `MirrorUrl()` 改写主机（`libraries.minecraft.net` → `/maven`、
+  `resources.download.minecraft.net` → `/assets`）；客户端 jar 直接用 `/version/<id>/client`，
+  不依赖 `piston-data` 的跳转。
+- **16 路并发**：一个版本三四千个资源对象，串行下载会被单次往返延迟拖死，
+  所以用线程池按原子计数器取任务。
+- **断点续传**：每个文件先写 `<file>.part`，校验字节数后再 `MoveFileEx` 覆盖；
+  目标文件已存在且大小正确就直接跳过，中断后重开只补缺的那部分。
+- 下载完成会自动重扫版本列表、选中新版本并写回 `config.ini`。
+- 下载中点「取消」只停工作线程，已下好的文件保留；切到别的标签页下载**照常继续**。
+
 ## 已知限制
 
-- 不自动下载 `libraries` / `assets`，也不校验 assets 完整性。
+- 启动时不会自动补全依赖与资源（请先到「下载」页把版本装全），也没有 assets 完整性校验。
 - 微软账号只完成登录，不校验游戏所有权（跳过 `/entitlements`）。
 - 版本没装全时不会自动补齐，只会提示缺多少个依赖文件（首个路径会显示在日志里）。
 - 无边框窗口不支持拖拽缩放（启动器一般也不需要）。
