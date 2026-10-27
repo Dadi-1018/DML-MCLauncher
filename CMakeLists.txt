@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(DreamMinecraftLauncher VERSION 0.3.0 LANGUAGES CXX)
+project(DreamMinecraftLauncher VERSION 0.3.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,7 +16,7 @@ if (WIN32)
 endif()
 
 target_compile_definitions(DML PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(DML PRIVATE gdiplus shell32 ole32 user32 gdi32 winhttp crypt32 comdlg32)
+target_link_libraries(DML PRIVATE gdiplus shell32 ole32 user32 gdi32 winhttp crypt32 comdlg32 winmm)
 
 if (MSVC)
     target_compile_options(DML PRIVATE /EHsc /MT)

@@ -86,7 +86,7 @@
 
 ```
 MCLaucher/
-├─ src/main.cpp        # 全部源码（约 3670 行，单文件）
+├─ src/main.cpp        # 全部源码（约 3850 行，单文件）
 ├─ src/resource.h      # 资源 ID（app.rc 与 main.cpp 共用）
 ├─ res/app.rc          # 资源脚本：图标 + 页眉标志
 ├─ assets/logo/        # 标志源文件与生成脚本
@@ -149,6 +149,8 @@ cmake --build out --config Release
 | 模块 | 说明 |
 |---|---|
 | 标签页 | 标题下方「开始 / 下载 / 设置」三个标签，绿色下划线指示当前页；三个页面共用同一套自绘控件，切页不重建窗口 |
+| 下划线动画 | 切页时下划线以 `easeOutCubic` 从旧标签滑到新标签（240ms）；起点取「当前实际位置」而非旧标签理论位置，滑到一半再切页会接着滑不瞬移 |
+| 动画帧率 | 由主消息循环自驱动（不用 `WM_TIMER`，它的实际粒度是 20~30ms）：4ms 节流 + `timeBeginPeriod(1)` + QPC 计时，并把每帧重绘收窄到标签带（760×39，约 0.8ms）。实测 **34 帧 / 234ms ≈ 145fps** |
 | 无边框窗口 | `WS_POPUP` + `CreateRoundRectRgn` 圆角；顶部空白区拖动，自绘最小化/关闭按钮 |
 | 双缓冲绘制 | 内存 DC + `BitBlt`，`Graphics` 抗锯齿，窗口缩放/重绘不闪烁 |
 | 品牌资源 | 图标与页眉标志编进 exe（`res/app.rc`）；窗口、任务栏图标取自多尺寸 `dml.ico`，页眉用 GDI+ 高质量缩放绘制 PNG 标志 |

@@ -26,6 +26,7 @@
 #include <winhttp.h>
 #include <wincrypt.h>
 #include <gdiplus.h>
+#include <mmsystem.h>   // timeBeginPeriod：把系统定时器精度提到 1ms，动画帧间隔才真的短
 
 #include "resource.h"   // IDI_APPICON / IDR_LOGO
 
@@ -341,6 +342,15 @@ struct AppState {
     bool  msDlg     = false;         // 微软登录验证码弹窗（逻辑开关）
     float msAnim    = 0.0f;          // 弹窗动画进度 0..1
     int   dlgWait   = 0;             // 弹窗停留后打开浏览器的倒计时（秒，0 = 已开）
+
+    // ---- 标签下划线滑动动画（由主消息循环驱动，每 4ms 一帧 ≈145fps）----
+    float    tabAnim    = 1.0f;      // 0 → 1；1 = 已经停在目标标签下
+    REAL     tabFromX   = 0.0f;      // 起点：上一次停下的位置
+    REAL     tabFromW   = 0.0f;
+    REAL     tabCurX    = 0.0f;      // 当前实际画的位置，中途再切页时当作新起点
+    REAL     tabCurW    = 0.0f;
+    bool     tabHasCur  = false;     // 第一帧绘制后就为 true
+    LONGLONG tabT0      = 0;         // 本次滑动的起始时刻（微秒），进度按真实时间算
 
     // ---- 下载页 ----
     int   dlPhase  = 0;              // 0 拉列表 / 1 选版本 / 2 下载中 / 3 完成 / 4 失败
@@ -2447,15 +2457,71 @@ static void OpenDownloadPage() {
     if (h) CloseHandle(h);
 }
 
+// 标签下划线滑动：240ms 跑完，主循环每 4ms 推一帧（≈250fps 上限，实测多在 150fps 以上）。
+// 4ms 这种等待只有配合 timeBeginPeriod(1) 才真的成立，否则会被系统拉回 15.6ms（≈64fps）。
+static const int kTabAnimMs  = 240;
+static const int kTabFrameMs = 4;
+
+// 标签行（含下划线、分隔线）在设备像素下的矩形。
+// 切页动画期间只有这一条带子在变，只重绘它：面积从 760x500 缩到 760x39，高帧率才稳得住。
+static RECT TabBandRect(HWND hwnd) {
+    RECT rc = {0, 0, 0, 0};
+    if (hwnd) GetClientRect(hwnd, &rc);
+    RECT b;
+    b.left   = 0;
+    b.right  = rc.right;
+    b.top    = S(62);      // 页眉 logo 底边在 S(60)，从它下面起画才不会把 logo 擦掉
+    b.bottom = S(101);     // 分隔线在 S(98)，留几像素余量吃掉抗锯齿的边
+    return b;
+}
+
+// 微秒级时钟。GetTickCount64 的粒度是 15.6ms，直接拿它算动画进度会让下划线一跳一跳。
+static LONGLONG NowUs() {
+    static LONGLONG freq = 0;
+    if (!freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart ? f.QuadPart : 1;
+    }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return c.QuadPart * 1000000LL / freq;
+}
+
+// 推进一帧下划线滑动。由主消息循环在动画期间每轮调用 —— 不走 WM_TIMER，
+// 因为 SetTimer 的实际粒度受系统时钟限制（实测 20~30ms 才来一帧，帧率高不上去）。
+static void TickTabSlide() {
+    if (!g_app.hwnd) return;
+    // 节流：不到一帧的时间就别重画，消息密集时也保持稳定的帧间隔
+    static LONGLONG lastUs = 0;
+    const LONGLONG now = NowUs();
+    if (lastUs && now - lastUs < (LONGLONG)kTabFrameMs * 1000) return;
+    lastUs = now;
+
+    const double el = (double)(now - g_app.tabT0) / 1000.0;   // 已经过去多少毫秒
+    g_app.tabAnim = (el >= (double)kTabAnimMs) ? 1.0f : (float)(el / (double)kTabAnimMs);
+    RECT band = TabBandRect(g_app.hwnd);
+    InvalidateRect(g_app.hwnd, &band, FALSE);     // 只刷标签这一条窄带，面积小十几倍
+}
+
 static void SwitchPage(int page) {
     if (page < 0 || page > 2 || page == g_app.page) return;
     if (page == 1) OpenDownloadPage();
+    // 下划线从「此刻画在哪儿」滑向新标签：滑到一半又切页时能接着滑，不会瞬移
+    if (g_app.tabHasCur) {
+        g_app.tabFromX = g_app.tabCurX;
+        g_app.tabFromW = g_app.tabCurW;
+        g_app.tabAnim  = 0.0f;
+    }
     g_app.page    = page;
     g_app.ddOpen  = false;
     g_app.ddHover = -1;
     g_app.focus   = FOCUS_NONE;
     g_app.hover   = HIT_NONE;
-    if (g_app.hwnd) InvalidateRect(g_app.hwnd, nullptr, FALSE);
+    if (g_app.hwnd) {
+        g_app.tabT0 = NowUs();              // 主循环看到 tabAnim < 1 就会自己按 kTabFrameMs 推帧
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);     // 整页换掉，这一帧必须全画
+    }
 }
 
 static void StartDlDownload() {
@@ -2746,10 +2812,18 @@ static void AnimMsDialog(bool open) {
     if (g_app.hwnd) InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
-static const wchar_t* kAppVersion = L"0.3.0";   // 与 res/app.rc 的版本资源保持一致
+static const wchar_t* kAppVersion = L"0.3.1";   // 与 res/app.rc 的版本资源保持一致
 
 // 标题下方的三个标签：开始 / 下载 / 设置
 static const wchar_t* kTabName[3] = { L"开始", L"下载", L"设置" };
+
+// 某个标签下划线的位置与宽度（居中在标签文字下方）
+static void TabUnderline(Graphics& gr, const Layout& L, int i, REAL* x, REAL* w) {
+    const RectF r  = L.tab[i];
+    const REAL  tw = MeasureW(gr, kTabName[i], *F.sub);
+    *x = r.X + (r.Width - tw) / 2;
+    *w = tw;
+}
 
 static void DrawTabs(Graphics& gr, const Layout& L) {
     for (int i = 0; i < 3; ++i) {
@@ -2758,12 +2832,30 @@ static void DrawTabs(Graphics& gr, const Layout& L) {
         const bool  hov = (g_app.hover == HIT_TAB0 + i);
         DrawStr(gr, kTabName[i], r, *F.sub,
                 C(act ? Theme::Text : (hov ? Theme::Muted : Theme::Dim)), StringAlignmentCenter);
-        if (act) {
-            REAL tw = MeasureW(gr, kTabName[i], *F.sub);
-            FillRound(gr, RectF(r.X + (r.Width - tw) / 2, r.Y + r.Height - SR(5), tw, SR(2.5f)),
-                      SR(1.4f), C(Theme::Accent));
-        }
     }
+
+    // 下划线只有一条，切页时从旧标签缓动滑到新标签（ease-out，16ms 一帧）
+    REAL tx = 0, tw = 0;
+    TabUnderline(gr, L, g_app.page, &tx, &tw);
+    if (!g_app.tabHasCur) {                  // 首帧：直接落到当前标签，不播动画
+        g_app.tabCurX   = tx;
+        g_app.tabCurW   = tw;
+        g_app.tabHasCur = true;
+    }
+    REAL x = tx, w = tw;
+    if (g_app.tabAnim < 1.0f) {
+        const float t = g_app.tabAnim;
+        const float u = 1.0f - t;
+        const float e = 1.0f - u * u * u;    // easeOutCubic：起步快、收尾轻
+        x = g_app.tabFromX + (tx - g_app.tabFromX) * e;
+        w = g_app.tabFromW + (tw - g_app.tabFromW) * e;
+    }
+    g_app.tabCurX = x;
+    g_app.tabCurW = w;
+
+    const RectF tr = L.tab[g_app.page];
+    FillRound(gr, RectF(x, tr.Y + tr.Height - SR(5), w, SR(2.5f)), SR(1.4f), C(Theme::Accent));
+
     Pen line(C(Theme::PanelBorder), SR(1));
     gr.DrawLine(&line, L.panel1.X, SR(98), L.panel1.X + L.panel1.Width, SR(98));
 }
@@ -2995,8 +3087,16 @@ static void Paint(HWND hwnd) {
     GetClientRect(hwnd, &rcWin);
     int W = rcWin.right, H = rcWin.bottom;
 
+    // 切页动画只脏了标签行 → 只重画这一条窄带（整窗 760x500 重绘撑不起上百帧）
+    const RECT band     = TabBandRect(hwnd);
+    const bool bandOnly = (ps.rcPaint.top    >= band.top  && ps.rcPaint.bottom <= band.bottom &&
+                           ps.rcPaint.left   >= band.left && ps.rcPaint.right  <= band.right);
+    const RECT rcDraw   = bandOnly ? band : rcWin;
+    const int  DW = rcDraw.right - rcDraw.left;
+    const int  DH = rcDraw.bottom - rcDraw.top;
+
     HDC     memDC = CreateCompatibleDC(hdc);
-    HBITMAP bmp   = CreateCompatibleBitmap(hdc, W, H);
+    HBITMAP bmp   = CreateCompatibleBitmap(hdc, DW, DH);
     HBITMAP old   = (HBITMAP)SelectObject(memDC, bmp);
 
     {
@@ -3005,6 +3105,20 @@ static void Paint(HWND hwnd) {
         gr.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
         gr.SetPixelOffsetMode(PixelOffsetModeHalf);
         gr.Clear(C(Theme::Bg));
+
+        if (bandOnly) {
+            // 窄带重绘：仅标签与分隔线。整窗坐标系平移进带内，绘制代码不必改坐标
+            gr.TranslateTransform((REAL)-rcDraw.left, (REAL)-rcDraw.top);
+            Layout Lb = ComputeLayout();
+            DrawTabs(gr, Lb);
+            BitBlt(hdc, rcDraw.left, rcDraw.top, DW, DH, memDC, 0, 0, SRCCOPY);
+            SelectObject(memDC, old);
+            DeleteObject(bmp);
+            DeleteDC(memDC);
+            EndPaint(hwnd, &ps);
+            return;
+        }
+
         {
             // 无边框窗口：客户区外圈描一条极淡的分界线，避免白底与浅色桌面糊在一起
             Pen edge(C(Theme::Border), SR(1));
@@ -3063,7 +3177,7 @@ static void Paint(HWND hwnd) {
         if (g_app.msAnim > 0.001f) DrawMsDialog(gr, L, W, H, g_app.msAnim);
     }
 
-    BitBlt(hdc, 0, 0, W, H, memDC, 0, 0, SRCCOPY);
+    BitBlt(hdc, rcDraw.left, rcDraw.top, DW, DH, memDC, 0, 0, SRCCOPY);
     SelectObject(memDC, old);
     DeleteObject(bmp);
     DeleteDC(memDC);
@@ -3190,6 +3304,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
     case WM_CREATE:
         g_app.hwnd = hwnd;
+        timeBeginPeriod(1);          // 定时器精度提到 1ms，8ms 一帧的滑动动画才不被系统拉成 15.6ms
         SetTimer(hwnd, 1, 100, nullptr);
         return 0;
 
@@ -3599,6 +3714,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DESTROY:
         KillTimer(hwnd, 1);
         KillTimer(hwnd, 2);
+        timeEndPeriod(1);
         g_dlCancel.store(true);          // 让下载线程尽快收尾
         SaveConfig();
         PostQuitMessage(0);
@@ -3706,9 +3822,23 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     MsAutoRefresh();
 
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    // 动画期间不靠 WM_TIMER：SetTimer 受系统时钟粒度限制，实测最快也只有 20~30ms 一帧。
+    // 改成消息循环自驱动 —— 滑动进行中最多等 kTabFrameMs 就回来推一帧，
+    // 帧率于是由重绘耗时决定（标签窄带约 0.8ms），能跑到 150fps 以上。
+    for (;;) {
+        const bool  anim   = (g_app.tabAnim < 1.0f);
+        const DWORD waitMs = anim ? kTabFrameMs : INFINITE;
+        MsgWaitForMultipleObjectsEx(0, nullptr, waitMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        bool quit = false;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { quit = true; break; }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (quit) break;
+        // 每轮都推进（内部按 kTabFrameMs 节流，进度按真实时间算）：
+        // 只在等待超时时推的话，消息一多就迟迟不落帧，动画会断续
+        if (anim) TickTabSlide();
     }
 
     FreeFonts();

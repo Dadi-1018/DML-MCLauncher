@@ -65,7 +65,7 @@ if defined GXX (
     echo     Compiling and linking ...
     "!GXX!" -std=c++17 -O2 -mwindows -static -s ^
         src\main.cpp build\app.res.o -o build\DML.exe ^
-        -lgdiplus -lshell32 -lole32 -lgdi32 -luser32 -lcomdlg32 -luuid -lwinhttp -lcrypt32
+        -lgdiplus -lshell32 -lole32 -lgdi32 -luser32 -lcomdlg32 -luuid -lwinhttp -lcrypt32 -lwinmm
     if errorlevel 1 goto :fail
     del /q build\DML.pdb 2>nul
     goto :done
@@ -82,7 +82,7 @@ if defined ZIGEXE (
     echo     [WARN] zig cannot compile .rc - output will have no icon / logo
     "%ZIGEXE%" c++ -target x86_64-windows-gnu -std=c++17 -O2 ^
         src\main.cpp -o build\DML.exe ^
-        -Wl,--subsystem,windows -Wl,-s -lgdiplus -lshell32 -lole32 -lgdi32 -luser32 -lwinhttp -lcrypt32
+        -Wl,--subsystem,windows -Wl,-s -lgdiplus -lshell32 -lole32 -lgdi32 -luser32 -lwinhttp -lcrypt32 -lwinmm
     if errorlevel 1 goto :fail
     del /q build\DML.pdb 2>nul
     goto :done

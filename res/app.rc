@@ -20,8 +20,8 @@ IDR_LOGO     RCDATA  "../assets/logo/dml-logo-256.png"
 //  CMakeLists.txt 的 project(... VERSION)，以及 src/main.cpp 的 kAppVersion
 // ---------------------------------------------------------------------------
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION     0,3,0,0
- PRODUCTVERSION  0,3,0,0
+ FILEVERSION     0,3,1,0
+ PRODUCTVERSION  0,3,1,0
  FILEFLAGSMASK   0x3fL
  FILEFLAGS       0x0L
  FILEOS          VOS_NT_WINDOWS32
@@ -34,12 +34,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Dadi"
             VALUE "FileDescription",  "Dream Minecraft Launcher"
-            VALUE "FileVersion",      "0.3.0"
+            VALUE "FileVersion",      "0.3.1"
             VALUE "InternalName",     "DML"
             VALUE "LegalCopyright",   "Copyright (c) 2026 Dadi"
             VALUE "OriginalFilename", "DML.exe"
             VALUE "ProductName",      "Dream Minecraft Launcher"
-            VALUE "ProductVersion",   "0.3.0"
+            VALUE "ProductVersion",   "0.3.1"
         END
     END
     BLOCK "VarFileInfo"
