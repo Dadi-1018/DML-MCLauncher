@@ -11,6 +11,9 @@ build/
 # ---- 编辑器 / IDE ----
 .vs/
 .vscode/
+# CLion：workspace.xml 与 CMakeCache 都会写进本机绝对路径，整目录别入库
+.idea/
+cmake-build-*/
 *.user
 *.suo
 CMakeCache.txt

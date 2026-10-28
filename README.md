@@ -163,6 +163,8 @@ cmake --build out --config Release
 | 版本下载 | 「下载」标签页，数据取自 **BMCLAPI 镜像**：版本清单 → 版本 JSON → 客户端 jar → 依赖库（含 windows 分类器）→ 资源索引 → 全部资源对象，下完直接出现在版本下拉里 |
 | 并发与续传 | 16 路并发拉小文件；按字节数校验完整性，目标文件已存在且大小正确就跳过，中断后重按即续传 |
 | 下载页 | 正式版 / 快照 / 全部三档筛选、滚轮翻页、↑↓ 选择、回车即下；进度页显示百分比、文件数、字节数与当前文件 |
+| Forge 分区 | 下载页右上角切「原版 / Forge / OptiFine」，先选 Minecraft 版本再挑 Forge 构建，把 installer 下到 `.minecraft\forge-installers\`（只下包，不在启动器里执行安装） |
+| OptiFine 分区 | 同一排胶囊切到 OptiFine，二级列出该版本全部补丁（正式版在前、`pre` 预览版在后），jar 下到 `.minecraft\optifine\`（同样只下包） |
 | 账号登录 | 昵称框下方「离线登录 / 微软登录」两个胶囊（默认离线）；微软走设备码授权 → XBL → XSTS → Minecraft Services，成功后用**正版游戏 ID** 覆盖昵称，启动时注入真实 `accessToken` / `uuid` / `xuid` |
 | 令牌安全 | refresh token 经 DPAPI（`CryptProtectData`）加密后落盘，下次启动静默续期；access token 只留在内存 |
 | 验证码弹窗 | 码就绪即复制到剪贴板并弹出卡片（160ms ease-out 动画），倒计时 5 秒后自动唤起浏览器，点「重新打开浏览器」可立即打开 |
@@ -222,7 +224,12 @@ BuildDlPlan     版本 JSON + 客户端 jar + 依赖库 + 资源索引 + 资源�
 HttpDownload    流式下载到 .part → 原子改名，按 size 校验
 DlWorker        16 路并发工作线程：原子取任务、跳过已存在文件、累计字节
 DlThread        单个版本的下载总控（建计划 → 线程池 → 汇报 UI）
-DrawDlPage      下载页：筛选列表 / 进度面板 / 完成与失败
+FgListThread    拉某个 Minecraft 版本的 Forge 构建列表（按数字分段倒序排）
+FgDownloadThread 下单个 installer jar，只落盘不执行
+OfListThread    拉某个 Minecraft 版本的 OptiFine 补丁列表（字母段/数字段交替排序）
+OfDownloadThread 下单个 OptiFine jar（走 maven 直链），只落盘不执行
+RebuildFgRows   按阶段重建附加组件列表（一级 MC 版本 / 二级 Forge 构建或 OptiFine 补丁）
+DrawDlPage      下载页：筛选列表 / 进度面板 / 完成与失败（三种来源共用）
 Paint           绘制入口（背景 → 标签页 → 当前页 → 浮层 → 弹窗）
 WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动 / 启动进度
 ```
@@ -285,6 +292,38 @@ WndProc         消息处理：绘制 / 命中测试 / 输入 / 拖动 / 启动�
   目标文件已存在且大小正确就直接跳过，中断后重开只补缺的那部分。
 - 下载完成会自动重扫版本列表、选中新版本并写回 `config.ini`。
 - 下载中点「取消」只停工作线程，已下好的文件保留；切到别的标签页下载**照常继续**。
+
+### Forge / OptiFine（附加组件）
+
+下载页右上角有「原版 / Forge / OptiFine」三个胶囊，后两者是**两级列表**：
+
+| 级别 | 内容 | 数据来源 |
+|---|---|---|
+| 一级 | Minecraft **正式版**（快照不列） | 复用同一份版本清单，取 `type == release` |
+| 二级（Forge） | 该 MC 版本的全部 Forge 构建，按版本号**数字分段**倒序（`47.0.10` 排在 `47.0.9` 前面） | `/forge/minecraft/<mc>` |
+| 二级（OptiFine） | 该 MC 版本的全部补丁，正式版在前、`pre` 预览版在后，各自倒序（`HD_U_I6` → `HD_U_I5`，`pre6` → `pre1`） | `/optifine/<mc>` |
+
+**Forge**
+
+- 列表只保留 `files[]` 里真的带 `category=installer, format=jar` 的构建。
+- 点「下载安装包」走 `/forge/download?mcversion=&version=&category=installer&format=jar`，
+  镜像会 302 到 CDN，由 WinHTTP 自动跟随；落点 `.minecraft\forge-installers\forge-<mc>-<for-ver>-installer.jar`。
+
+**OptiFine**
+
+- 一个请求就拿到该版本的全部补丁，元素带 `type`（正式是 `HD_U`，预览版是 `HD_U_I5`）、
+  `patch`（`I6` / `pre4`）、`filename` 与 `forge`（配套的 Forge 版本，显示在行右端）。
+- 下载走 **maven 直链** `/maven/com/optifine/<mc>/<filename>`：官方 `/optifine/<mc>/<type>/<patch>`
+  的 302 给的是相对路径 `Location`，WinHTTP 未必跟得对；列表里已经有完整文件名，直接拼更稳。
+  落点 `.minecraft\optifine\<filename>`。
+- 排序用 `OfCmp` 做「字母段 / 数字段」交替比较，`I10` 才会排在 `I9` 之后、`J1` 排在 `I6` 之前。
+
+**两者共同**
+
+- **只下包、不执行安装**：jar 需要双击运行（Forge 也可 `java -jar ... --installClient`）才会真正把
+  libraries 与版本 JSON 写进 `.minecraft`。启动器里不做这件事，失败面太大。
+- 单文件下载同样显示百分比与字节进度（用 `Content-Length` 算），进度面板与原版共用。
+- 换来源会丢掉上一来源的缓存；列表请求带来源标记，回来时对不上就直接作废，避免串台。
 
 ## 已知限制
 

@@ -359,6 +359,15 @@ struct AppState {
     int   dlScroll = 0;
     int   dlHover  = -1;
     std::wstring dlTarget;           // 正在下载 / 刚下载完的版本 id
+
+    // ---- 下载页内的「附加组件」分区：Forge / OptiFine（只下安装包，不自动执行安装）----
+    int   dlSrc    = 0;              // 0 原版 / 1 Forge / 2 OptiFine
+    int   fgStage  = 0;              // 0 选 MC 版本 / 1 拉构建中 / 2 选构建 / 3 完成 / 4 失败 / 5 下载中
+    int   fgSel    = 0;
+    int   fgScroll = 0;
+    int   fgHover  = -1;
+    std::wstring fgMc;               // 选中的 Minecraft 版本
+    std::wstring fgSaved;            // 上一次保存到的完整路径
 };
 
 static AppState g_app;
@@ -1967,7 +1976,7 @@ static std::atomic<int>       g_dlFilesTotal{0};
 static std::atomic<long long> g_dlBytesDone{0};
 static std::atomic<long long> g_dlBytesTotal{0};
 static std::atomic<bool>      g_dlCancel{false};
-static std::atomic<bool>      g_dlBusy{false};     // 有下载线程在跑（防止并发两份）
+static std::atomic<bool>      g_dlBusy{false};     // 清单线程在跑（防止来回切来源时重复拉）
 
 static CRITICAL_SECTION g_dlLock;
 static bool             g_dlLockReady = false;
@@ -2037,8 +2046,9 @@ static std::wstring MirrorUrl(std::wstring u) {
 }
 
 // ---- 单文件下载：流式写 .part，完成后再改名，断点续传由「跳过已存在」实现 ----
+// progress = true 时把 Content-Length 写进 g_dlBytesTotal，供单文件进度条用
 static bool HttpDownload(const std::wstring& url, const std::wstring& dst, long long expect,
-                         std::wstring& err) {
+                         std::wstring& err, bool progress = false) {
     err.clear();
     URL_COMPONENTS uc;
     ZeroMemory(&uc, sizeof(uc));
@@ -2078,6 +2088,13 @@ static bool HttpDownload(const std::wstring& url, const std::wstring& dst, long 
         WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                             WINHTTP_HEADER_NAME_BY_INDEX, &st, &sl, WINHTTP_NO_HEADER_INDEX);
         if (st != 200) { err = L"HTTP " + std::to_wstring(st); break; }
+
+        if (progress) {                       // 单文件下载：拿总字节数好算百分比
+            DWORD cl = 0, cll = sizeof(cl);
+            if (WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &cl, &cll, WINHTTP_NO_HEADER_INDEX))
+                if (cl > 0) g_dlBytesTotal.store((long long)cl);
+        }
 
         MakeDirs(ParentDirOf(dst));
         fp = _wfopen(tmp.c_str(), L"wb");
@@ -2174,6 +2191,7 @@ static DWORD WINAPI DlManifestThread(LPVOID) {
     g_dlList.swap(list);
     g_dlErr = err;
     LeaveCriticalSection(&g_dlLock);
+    g_dlBusy.store(false);
 
     if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_APP_DL, 1, 0);
     return 0;
@@ -2409,6 +2427,323 @@ static DWORD WINAPI DlThread(LPVOID param) {
     return 0;
 }
 
+// ---- Forge 分区：/forge/minecraft/<mc> 拿构建列表，installer 走 /forge/download ----
+// 只负责把安装包下到 .minecraft\forge-installers\，不在启动器里执行安装
+struct ForgeBuild {
+    std::wstring ver;        // Forge 版本号，如 47.0.1
+    std::wstring mc;         // 对应的 Minecraft 版本
+    std::wstring date;       // 最后修改日期（只取 yyyy-mm-dd）
+};
+
+struct ForgeRow {            // 列表里的一行：一级是 MC 版本，二级是 Forge 构建，共用同一套绘制
+    std::wstring left;
+    std::wstring right;
+    std::wstring tag;
+};
+
+static std::vector<ForgeBuild> g_fgList;
+static std::vector<ForgeRow>   g_fgRows;
+static std::wstring            g_fgErr;
+static std::wstring            g_fgLastPath;      // 下载成功后保存到的完整路径（锁内写）
+static std::atomic<bool>       g_fgBusy{false};
+
+// OptiFine 同样走「一级 MC 版本 / 二级组件」这套列表，只是行内容不同
+struct OfBuild {
+    std::wstring type;       // HD_U（正式）/ HD_U_I5（预览版所属的正式版号）
+    std::wstring patch;      // I6 / pre4
+    std::wstring name;       // 展示名：HD_U_I6 / HD_U_I5_pre4
+    std::wstring file;       // 原始文件名，落盘和拼 URL 都用它
+    std::wstring forge;      // 配套的 Forge 版本（右侧副信息）
+    bool         preview = false;
+};
+
+static std::vector<OfBuild> g_ofList;
+static std::atomic<bool>    g_ofBusy{false};
+static std::atomic<int>     g_srcReq{0};   // 列表请求属于哪个来源；回来时对不上就作废
+
+static long long VerSeg(const std::wstring& s, size_t b, size_t e) {
+    long long v = 0;
+    for (size_t i = b; i < e && i < s.size(); ++i) {
+        if (s[i] < L'0' || s[i] > L'9') break;
+        v = v * 10 + (long long)(s[i] - L'0');
+    }
+    return v;
+}
+
+// 版本号按数字分段比较：47.0.10 要排在 47.0.9 之后，用字符串比会反过来
+static bool VerGreater(const std::wstring& a, const std::wstring& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        size_t ie = i, je = j;
+        while (ie < a.size() && a[ie] != L'.') ++ie;
+        while (je < b.size() && b[je] != L'.') ++je;
+        const long long na = VerSeg(a, i, ie), nb = VerSeg(b, j, je);
+        if (na != nb) return na > nb;
+        i = (ie < a.size()) ? ie + 1 : ie;
+        j = (je < b.size()) ? je + 1 : je;
+    }
+    return a.size() > b.size();
+}
+
+static void ClampFgScroll() {
+    const int n = (int)g_fgRows.size();
+    if (g_app.fgSel >= n) g_app.fgSel = n - 1;
+    if (g_app.fgSel < 0)  g_app.fgSel = 0;
+    const int maxScroll = std::max(0, n - DL_ROWS);
+    if (g_app.fgScroll > maxScroll) g_app.fgScroll = maxScroll;
+    if (g_app.fgScroll < 0)         g_app.fgScroll = 0;
+}
+
+// 按阶段重建可见行：0 = 一级（MC 正式版），其余 = 二级（Forge 构建 / OptiFine 补丁）
+static void RebuildFgRows() {
+    g_fgRows.clear();
+    if (g_app.fgStage == 0) {
+        for (size_t i = 0; i < g_dlList.size(); ++i) {
+            if (g_dlList[i].type != L"release") continue;      // Forge / OptiFine 只为正式版发布
+            ForgeRow r;
+            r.left  = g_dlList[i].id;
+            r.right = g_dlList[i].date;
+            r.tag   = L"Minecraft";
+            g_fgRows.push_back(r);
+        }
+    } else if (g_app.dlSrc == 2) {
+        for (size_t i = 0; i < g_ofList.size(); ++i) {
+            ForgeRow r;
+            r.left  = g_ofList[i].name;                        // HD_U_I6 / HD_U_I5_pre4
+            r.right = g_ofList[i].forge;                       // 配套的 Forge 版本
+            r.tag   = g_ofList[i].preview ? L"预览" : L"正式";
+            g_fgRows.push_back(r);
+        }
+    } else if (!g_fgList.empty()) {
+        for (size_t i = 0; i < g_fgList.size(); ++i) {
+            ForgeRow r;
+            r.left  = g_fgList[i].ver;
+            r.right = g_fgList[i].date;
+            r.tag   = L"installer";
+            g_fgRows.push_back(r);
+        }
+    }
+    ClampFgScroll();
+}
+
+static DWORD WINAPI FgListThread(LPVOID param) {
+    const std::wstring mc = *(std::wstring*)param;
+    delete (std::wstring*)param;
+
+    HttpResp r = HttpCall(L"GET", std::wstring(kDlBase) + L"/forge/minecraft/" + mc,
+                          std::string(), std::wstring(), std::wstring());
+    std::vector<ForgeBuild> list;
+    std::wstring err;
+
+    if (r.status == 200 && !r.body.empty()) {
+        JVal root;
+        if (ParseJsonUtf8(r.body, root) && root.t == JVal::ARR) {
+            for (size_t i = 0; i < root.a.size(); ++i) {
+                const JVal& it = root.a[i];
+                bool hasInstaller = false;                     // 只留真的带 installer/jar 的
+                const JVal* files = it.get(L"files");
+                if (files && files->t == JVal::ARR) {
+                    for (size_t k = 0; k < files->a.size(); ++k) {
+                        if (files->a[k].str(L"category") == L"installer" &&
+                            files->a[k].str(L"format")   == L"jar") { hasInstaller = true; break; }
+                    }
+                }
+                if (!hasInstaller) continue;
+                ForgeBuild b;
+                b.ver  = it.str(L"version");
+                b.mc   = it.str(L"mcversion");
+                b.date = it.str(L"modified");
+                if (b.date.size() >= 10) b.date = b.date.substr(0, 10);
+                if (b.ver.empty()) continue;
+                list.push_back(b);
+            }
+            std::sort(list.begin(), list.end(), [](const ForgeBuild& x, const ForgeBuild& y) {
+                return VerGreater(x.ver, y.ver);               // 新版本排前面
+            });
+        }
+        if (list.empty()) err = L"这个版本没有可用的 Forge 构建";
+    } else {
+        err = r.status ? (L"获取 Forge 列表失败（HTTP " + std::to_wstring(r.status) + L"）")
+                       : (r.err.empty() ? L"获取 Forge 列表失败" : r.err);
+    }
+
+    EnterCriticalSection(&g_dlLock);
+    g_fgList.swap(list);
+    g_fgErr = err;
+    LeaveCriticalSection(&g_dlLock);
+    g_fgBusy.store(false);
+
+    if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_APP_DL, 4, 0);
+    return 0;
+}
+
+struct FgJob { std::wstring mc, ver; };
+
+static DWORD WINAPI FgDownloadThread(LPVOID param) {
+    FgJob job = *(FgJob*)param;
+    delete (FgJob*)param;
+
+    g_dlCancel.store(false);
+    g_dlFilesDone.store(0);
+    g_dlFilesTotal.store(1);
+    g_dlBytesDone.store(0);
+    g_dlBytesTotal.store(0);
+    EnterCriticalSection(&g_dlLock);
+    g_dlErr.clear();
+    LeaveCriticalSection(&g_dlLock);
+
+    const std::wstring gameDir = EffectiveGameDir();
+    std::wstring err;
+    std::wstring dst;
+    bool ok = false;
+    if (gameDir.empty()) {
+        err = L"无法确定游戏目录（%APPDATA% 不可用）";
+    } else {
+        dst = gameDir + L"\\forge-installers\\forge-" + job.mc + L"-" + job.ver + L"-installer.jar";
+        EnterCriticalSection(&g_dlLock);
+        g_dlCur = dst;
+        LeaveCriticalSection(&g_dlLock);
+        const std::wstring url = std::wstring(kDlBase) + L"/forge/download?mcversion=" + job.mc +
+                                 L"&version=" + job.ver + L"&category=installer&format=jar";
+        ok = HttpDownload(url, dst, -1, err, true);
+    }
+    if (ok && g_dlCancel.load()) { ok = false; err = L"已取消下载"; }
+
+    EnterCriticalSection(&g_dlLock);
+    if (!ok) g_dlErr = err.empty() ? std::wstring(L"下载失败") : err;
+    else     g_fgLastPath = dst;
+    g_dlCur.clear();
+    LeaveCriticalSection(&g_dlLock);
+    g_dlFilesDone.fetch_add(1);
+    if (ok) g_dlBytesDone.store(g_dlBytesTotal.load());
+
+    if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_APP_DL, ok ? 5 : 6, 0);
+    return 0;
+}
+
+// ---- OptiFine 分区：/optifine/<mc> 拿该版本全部补丁，jar 走 /maven/com/optifine/<mc>/<file> ----
+// 和 Forge 一样只落盘不执行；下回来的 jar 自己就是安装器（双击或 java -jar 都能装）
+// 字母段 / 数字段轮流比较：I10 要压过 I9、J1 要新于 I6，纯字符串比会反过来。
+// 返回正数表示 a 比 b 新。
+static int OfCmp(const std::wstring& a, const std::wstring& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() || j < b.size()) {
+        while (i < a.size() && a[i] == L'_') ++i;
+        while (j < b.size() && b[j] == L'_') ++j;
+        if (i >= a.size() || j >= b.size()) break;
+        const bool da = (a[i] >= L'0' && a[i] <= L'9');
+        const bool db = (b[j] >= L'0' && b[j] <= L'9');
+        if (da != db) return da ? -1 : 1;              // 字母段（版本字母）比数字段新
+        size_t ie = i, je = j;
+        while (ie < a.size() && a[ie] != L'_' &&
+               ((a[ie] >= L'0' && a[ie] <= L'9') == da)) ++ie;
+        while (je < b.size() && b[je] != L'_' &&
+               ((b[je] >= L'0' && b[je] <= L'9') == db)) ++je;
+        if (da) {
+            const long long na = VerSeg(a, i, ie), nb = VerSeg(b, j, je);
+            if (na != nb) return na > nb ? 1 : -1;
+        } else {
+            const std::wstring ta = a.substr(i, ie - i), tb = b.substr(j, je - j);
+            if (ta != tb) return ta > tb ? 1 : -1;
+        }
+        i = ie; j = je;
+    }
+    if (i < a.size()) return 1;
+    if (j < b.size()) return -1;
+    return 0;
+}
+
+static DWORD WINAPI OfListThread(LPVOID param) {
+    const std::wstring mc = *(std::wstring*)param;
+    delete (std::wstring*)param;
+
+    HttpResp r = HttpCall(L"GET", std::wstring(kDlBase) + L"/optifine/" + mc,
+                          std::string(), std::wstring(), std::wstring());
+    std::vector<OfBuild> list;
+    std::wstring err;
+
+    if (r.status == 200 && !r.body.empty()) {
+        JVal root;
+        if (ParseJsonUtf8(r.body, root) && root.t == JVal::ARR) {
+            for (size_t i = 0; i < root.a.size(); ++i) {
+                const JVal& it = root.a[i];
+                OfBuild b;
+                b.type = it.str(L"type");
+                b.patch = it.str(L"patch");
+                b.file  = it.str(L"filename");
+                b.forge = it.str(L"forge");
+                if (b.type.empty() || b.patch.empty() || b.file.empty()) continue;
+                b.name    = b.type + L"_" + b.patch;                  // HD_U_I6 / HD_U_I5_pre4
+                b.preview = (b.patch.size() >= 3 && b.patch.compare(0, 3, L"pre") == 0);
+                list.push_back(b);
+            }
+            std::stable_sort(list.begin(), list.end(), [](const OfBuild& x, const OfBuild& y) {
+                if (x.preview != y.preview) return !x.preview;             // 正式版永远排前面
+                return OfCmp(x.name, y.name) > 0;
+            });
+        }
+        if (list.empty()) err = L"这个版本没有可用的 OptiFine";
+    } else {
+        err = r.status ? (L"获取 OptiFine 列表失败（HTTP " + std::to_wstring(r.status) + L"）")
+                       : (r.err.empty() ? L"获取 OptiFine 列表失败" : r.err);
+    }
+
+    EnterCriticalSection(&g_dlLock);
+    g_ofList.swap(list);
+    g_fgErr = err;
+    LeaveCriticalSection(&g_dlLock);
+    g_ofBusy.store(false);
+
+    if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_APP_DL, 4, 0);
+    return 0;
+}
+
+struct OfJob { std::wstring mc, file, name; };
+
+static DWORD WINAPI OfDownloadThread(LPVOID param) {
+    OfJob job = *(OfJob*)param;
+    delete (OfJob*)param;
+
+    g_dlCancel.store(false);
+    g_dlFilesDone.store(0);
+    g_dlFilesTotal.store(1);
+    g_dlBytesDone.store(0);
+    g_dlBytesTotal.store(0);
+    EnterCriticalSection(&g_dlLock);
+    g_dlErr.clear();
+    LeaveCriticalSection(&g_dlLock);
+
+    const std::wstring gameDir = EffectiveGameDir();
+    std::wstring err;
+    std::wstring dst;
+    bool ok = false;
+    if (gameDir.empty()) {
+        err = L"无法确定游戏目录（%APPDATA% 不可用）";
+    } else {
+        dst = gameDir + L"\\optifine\\" + job.file;
+        EnterCriticalSection(&g_dlLock);
+        g_dlCur = dst;
+        LeaveCriticalSection(&g_dlLock);
+        // 走 maven 直链：/optifine/<mc>/<type>/<patch> 会 302 到相对路径，WinHTTP 未必跟得对，
+        // 而列表里已经给了完整文件名，直接拼 maven 路径最稳（同样是 302 → CDN 绝对地址）
+        const std::wstring url = std::wstring(kDlBase) + L"/maven/com/optifine/" +
+                                 job.mc + L"/" + job.file;
+        ok = HttpDownload(url, dst, -1, err, true);
+    }
+    if (ok && g_dlCancel.load()) { ok = false; err = L"已取消下载"; }
+
+    EnterCriticalSection(&g_dlLock);
+    if (!ok) g_dlErr = err.empty() ? std::wstring(L"下载失败") : err;
+    else     g_fgLastPath = dst;
+    g_dlCur.clear();
+    LeaveCriticalSection(&g_dlLock);
+    g_dlFilesDone.fetch_add(1);
+    if (ok) g_dlBytesDone.store(g_dlBytesTotal.load());
+
+    if (g_app.hwnd) PostMessageW(g_app.hwnd, WM_APP_DL, ok ? 5 : 6, 0);
+    return 0;
+}
+
 // ---- 下载页几何（绘制与命中测试共用，避免两边算错） ----
 static RectF DlPageRect() { return ComputeLayout().dlPanel; }
 
@@ -2419,6 +2754,12 @@ static RectF DlSubRect(const RectF& p, REAL x, REAL y, REAL w, REAL h) {
 static RectF DlFilterRect(const RectF& p, int i) {
     return DlSubRect(p, 24 + i * 78, 72, 70, 26);
 }
+// 页眉右上角的来源切换：原版 / Forge / OptiFine 三个胶囊，共 220 宽（70 × 3 + 5 × 2）
+static RectF DlSrcRect(const RectF& p, int i) {
+    return DlSubRect(p, 704 - 24 - 220 + i * 75, 12, 70, 26);
+}
+// Forge 二级列表左上角的「返回版本列表」
+static RectF DlBackRect(const RectF& p) { return DlSubRect(p, 24, 72, 96, 26); }
 static RectF DlGoRect(const RectF& p)     { return DlSubRect(p, 704 - 24 - 110, 312, 110, 34); }
 static RectF DlCancelRect(const RectF& p) { return DlSubRect(p, 704 - 24 - 110 - 10 - 96, 312, 96, 34); }
 
@@ -2452,9 +2793,10 @@ static void OpenDownloadPage() {
     g_app.dlScroll = 0;
     g_app.dlHover  = -1;
     if (g_app.dlPhase == 2) return;               // 正在下载时别重拉
+    if (g_dlBusy.exchange(true)) return;          // 已有清单线程在跑，来回切来源也别重复拉
     g_app.dlPhase = 0;
     HANDLE h = CreateThread(nullptr, 0, DlManifestThread, nullptr, 0, nullptr);
-    if (h) CloseHandle(h);
+    if (h) CloseHandle(h); else g_dlBusy.store(false);
 }
 
 // 标签下划线滑动：240ms 跑完，主循环每 4ms 推一帧（≈250fps 上限，实测多在 150fps 以上）。
@@ -2524,6 +2866,80 @@ static void SwitchPage(int page) {
     }
 }
 
+// 有下载在跑（原版整版 或 Forge/OptiFine 安装包）时，来源切换与筛选都锁住
+static bool DlBusy() {
+    return (g_app.dlSrc == 0 && g_app.dlPhase == 2) || (g_app.dlSrc != 0 && g_app.fgStage == 5);
+}
+
+// 一级：选中的 MC 版本 → 去拉这个版本的 Forge 构建 / OptiFine 补丁列表
+static void StartFgList() {
+    if (g_app.fgStage != 0) return;
+    if (g_app.fgSel < 0 || g_app.fgSel >= (int)g_fgRows.size()) return;
+
+    g_app.fgMc    = g_fgRows[(size_t)g_app.fgSel].left;
+    g_app.fgStage = 1;
+    g_app.fgSel   = 0;
+    g_app.fgScroll = 0;
+    EnterCriticalSection(&g_dlLock);
+    g_fgErr.clear();
+    g_fgList.clear();
+    g_ofList.clear();
+    LeaveCriticalSection(&g_dlLock);
+
+    HANDLE h;
+    g_srcReq.store(g_app.dlSrc);                   // 记下这批结果属于哪个来源
+    if (g_app.dlSrc == 2) {
+        g_ofBusy.store(true);
+        h = CreateThread(nullptr, 0, OfListThread, new std::wstring(g_app.fgMc), 0, nullptr);
+    } else {
+        g_fgBusy.store(true);
+        h = CreateThread(nullptr, 0, FgListThread, new std::wstring(g_app.fgMc), 0, nullptr);
+    }
+    if (h) CloseHandle(h);
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+}
+
+// 二级：下载选中的 Forge 安装包 / OptiFine 补丁 jar，只落盘不执行
+static void StartFgDownload() {
+    if (g_app.fgStage != 2) return;
+    const int sel = g_app.fgSel;
+    if (sel < 0 || sel >= (int)g_fgRows.size()) return;
+
+    const std::wstring mc = g_app.fgMc;
+    HANDLE h = nullptr;
+
+    if (g_app.dlSrc == 2) {
+        if (sel >= (int)g_ofList.size()) return;
+        const OfBuild b = g_ofList[(size_t)sel];
+        OfJob* job = new OfJob();
+        job->mc   = mc;
+        job->file = b.file;
+        job->name = b.name;
+
+        g_app.dlTarget = mc + L" · OptiFine " + b.name;
+        g_app.fgStage  = 5;
+        InvalidateRect(g_app.hwnd, nullptr, FALSE);
+
+        h = CreateThread(nullptr, 0, OfDownloadThread, job, 0, nullptr);
+        if (h) CloseHandle(h);
+        PushLog(L"下载 OptiFine " + b.name + L"（" + b.file + L"）…");
+        return;
+    }
+
+    const std::wstring ver = g_fgRows[(size_t)sel].left;
+    FgJob* job = new FgJob();
+    job->mc  = mc;
+    job->ver = ver;
+
+    g_app.dlTarget = mc + L" · Forge " + ver;
+    g_app.fgStage  = 5;
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+
+    h = CreateThread(nullptr, 0, FgDownloadThread, job, 0, nullptr);
+    if (h) CloseHandle(h);
+    PushLog(L"下载 Forge " + mc + L"-" + ver + L" 安装包 …");
+}
+
 static void StartDlDownload() {
     if (g_app.dlPhase != 1) return;
     if (g_app.dlSel < 0 || g_app.dlSel >= (int)g_dlView.size()) return;
@@ -2549,11 +2965,31 @@ static void DrawDlPage(Graphics& gr) {
     FillRound(gr, page, SR(14), C(Theme::Panel));
     StrokeRound(gr, page, SR(14), C(Theme::PanelBorder), SR(1));
 
-    DrawStr(gr, L"下载游戏版本", DlSubRect(page, 24, 12, 420, 28), *F.title, C(Theme::Text));
-    DrawStr(gr, L"BMCLAPI 镜像 · 下载后即可直接启动", DlSubRect(page, 24, 42, 560, 18),
-            *F.sub, C(Theme::Muted));
+    const bool alt = (g_app.dlSrc != 0);            // 非原版：走「选 MC 版本 → 选组件」两级列表
 
-    const bool running = (g_app.dlPhase == 2);
+    const wchar_t* pageTitle = (g_app.dlSrc == 2) ? L"下载 OptiFine"
+                             : (alt ? L"下载 Forge" : L"下载游戏版本");
+    const wchar_t* pageSub   = (g_app.dlSrc == 2)
+                             ? L"高清补丁 · 下载后双击即可装上光影与画质优化"
+                             : (alt ? L"Forge 安装包 · 下载后双击即可为游戏装上 mod 支持"
+                                    : L"BMCLAPI 镜像 · 下载后即可直接启动");
+    DrawStr(gr, pageTitle, DlSubRect(page, 24, 12, 420, 28), *F.title, C(Theme::Text));
+    DrawStr(gr, pageSub, DlSubRect(page, 24, 42, 560, 18), *F.sub, C(Theme::Muted));
+
+    const bool running = DlBusy();
+
+    // 来源切换：原版 / Forge / OptiFine（下载期间锁住，避免半途换源）
+    for (int i = 0; i < 3; ++i) {
+        static const wchar_t* srcNames[3] = { L"原版", L"Forge", L"OptiFine" };
+        RectF r = DlSrcRect(page, i);
+        const bool act = (g_app.dlSrc == i);
+        FillRound(gr, r, SR(9), C(act ? Theme::PillBg : Theme::Field));
+        StrokeRound(gr, r, SR(9), C(act ? Theme::PillBorder : Theme::Border),
+                    SR(act ? 1.3f : 1.0f));
+        DrawStr(gr, srcNames[i], r, *F.sub,
+                C(act ? Theme::PillText : (running ? Theme::Dim : Theme::Muted)),
+                StringAlignmentCenter);
+    }
 
     if (running) {
         // ---------------- 下载中：进度面板 ----------------
@@ -2576,9 +3012,10 @@ static void DrawDlPage(Graphics& gr) {
             FillRound(gr, RectF(bar.X, bar.Y, w, bar.Height), SR(5), C(Theme::Accent));
         }
 
-        DrawStr(gr, L"已下载 " + std::to_wstring(fn) + L" / " + std::to_wstring(ft) + L" 个文件",
-                DlSubRect(page, 24, 220, 656, 18), *F.sub, C(Theme::Muted),
-                StringAlignmentCenter);
+        if (g_app.dlSrc == 0)          // 附加组件只有一个 jar，报「1 个文件」没意义，只留字节数
+            DrawStr(gr, L"已下载 " + std::to_wstring(fn) + L" / " + std::to_wstring(ft) + L" 个文件",
+                    DlSubRect(page, 24, 220, 656, 18), *F.sub, C(Theme::Muted),
+                    StringAlignmentCenter);
         DrawStr(gr, HumanSize(bd) + L" / " + HumanSize(bt),
                 DlSubRect(page, 24, 238, 656, 18), *F.sub, C(Theme::Dim),
                 StringAlignmentCenter);
@@ -2589,8 +3026,8 @@ static void DrawDlPage(Graphics& gr) {
         LeaveCriticalSection(&g_dlLock);
         DrawStr(gr, cur, DlSubRect(page, 24, 264, 656, 18), *F.log, C(Theme::Dim),
                 StringAlignmentCenter, true);
-    } else {
-        // ---------------- 选择 / 完成 / 失败 ----------------
+    } else if (!alt) {
+        // ---------------- 原版：选择 / 完成 / 失败 ----------------
         for (int i = 0; i < 3; ++i) {
             static const wchar_t* names[3] = { L"正式版", L"快照", L"全部" };
             RectF r = DlFilterRect(page, i);
@@ -2634,6 +3071,57 @@ static void DrawDlPage(Graphics& gr) {
                     C(rel ? Theme::Accent : Theme::PillText), StringAlignmentCenter);
         }
         gr.ResetClip();
+    } else {
+        // ---------------- Forge / OptiFine：一级选 MC 版本，二级选组件 ----------------
+        if (g_app.fgStage == 2 || g_app.fgStage == 3 || g_app.fgStage == 4) {
+            RectF b = DlBackRect(page);
+            FillRound(gr, b, SR(9), C(Theme::FieldHover));
+            StrokeRound(gr, b, SR(9), C(Theme::Border), SR(1));
+            DrawStr(gr, L"‹ 返回", b, *F.sub, C(Theme::Muted), StringAlignmentCenter);
+            DrawStr(gr, L"Minecraft " + g_app.fgMc, DlSubRect(page, 132, 72, 420, 26),
+                    *F.sub, C(Theme::Text));
+        } else {
+            DrawStr(gr, g_app.dlSrc == 2
+                            ? L"只列正式版 · 选好 Minecraft 版本再挑 OptiFine 补丁"
+                            : L"只列正式版 · 选好 Minecraft 版本再挑 Forge 构建",
+                    DlSubRect(page, 24, 72, 520, 26), *F.log, C(Theme::Dim));
+        }
+
+        RectF lr = DlListRect(page);
+        FillRound(gr, lr, SR(12), C(Theme::Field));
+        StrokeRound(gr, lr, SR(12), C(Theme::Border), SR(1));
+
+        GraphicsPath clip;
+        AddRoundRect(clip, lr, SR(12));
+        gr.SetClip(&clip);
+        if (g_fgRows.empty()) {
+            const wchar_t* tip = L"没有可用的构建";
+            if (g_app.fgStage == 0)
+                tip = (g_dlList.empty() && g_app.dlPhase == 0) ? L"正在获取版本列表…"
+                                                               : L"没有可选的版本";
+            else if (g_app.fgStage == 1)
+                tip = (g_app.dlSrc == 2) ? L"正在获取 OptiFine 版本…" : L"正在获取 Forge 构建…";
+            DrawStr(gr, tip, lr, *F.sub, C(Theme::Dim), StringAlignmentCenter);
+        }
+        for (int i = 0; i < DL_ROWS; ++i) {
+            const int vi = g_app.fgScroll + i;
+            if (vi >= (int)g_fgRows.size()) break;
+            const ForgeRow& row = g_fgRows[(size_t)vi];
+            RectF r = DlRowRect(page, i);
+            const bool sel = (vi == g_app.fgSel);
+            if (sel || g_app.fgHover == vi)
+                FillRound(gr, r, SR(8), C(sel ? RGB(0xE7, 0xF5, 0xEC) : RGB(0xEA, 0xF0, 0xF9)));
+
+            DrawStr(gr, row.left, RectF(r.X + SR(12), r.Y, r.Width - SR(212), r.Height), *F.sub,
+                    C(sel ? Theme::Accent : Theme::Text), StringAlignmentNear, true);
+            DrawStr(gr, row.right, RectF(r.X + r.Width - SR(196), r.Y, SR(104), r.Height), *F.log,
+                    C(Theme::Dim), StringAlignmentFar);
+
+            RectF tag(r.X + r.Width - SR(84), r.Y + SR(7), SR(72), SR(18));
+            FillRound(gr, tag, SR(9), C(Theme::PillBg));
+            DrawStr(gr, row.tag, tag, *F.log, C(Theme::PillText), StringAlignmentCenter, true);
+        }
+        gr.ResetClip();
     }
 
     // 分隔线
@@ -2646,7 +3134,34 @@ static void DrawDlPage(Graphics& gr) {
     // 状态文字
     std::wstring status;
     Color statusCol = C(Theme::Muted);
-    if (g_app.dlPhase == 0)      status = L"正在获取版本列表…";
+    if (alt) {
+        const bool of = (g_app.dlSrc == 2);
+        if (g_app.fgStage == 0) {
+            status = (g_dlList.empty() && g_app.dlPhase == 0)
+                   ? std::wstring(L"正在获取版本列表…")
+                   : (L"共 " + std::to_wstring(g_fgRows.size()) + L" 个正式版 · 滚轮翻页");
+        } else if (g_app.fgStage == 1) {
+            status = of ? L"正在获取 OptiFine 版本列表…" : L"正在获取 Forge 构建列表…";
+        } else if (g_app.fgStage == 2) {
+            status = L"共 " + std::to_wstring(g_fgRows.size()) +
+                     (of ? L" 个 OptiFine 版本 · 滚轮翻页" : L" 个构建 · 滚轮翻页");
+        } else if (g_app.fgStage == 3) {
+            EnterCriticalSection(&g_dlLock);
+            status = L"已保存：" + (g_fgLastPath.empty()
+                                    ? (of ? std::wstring(L"optifine 目录")
+                                          : std::wstring(L"forge-installers 目录"))
+                                    : FileNameOf(g_fgLastPath));
+            LeaveCriticalSection(&g_dlLock);
+            statusCol = C(Theme::Accent);
+        } else if (g_app.fgStage == 5) {
+            status = L"正在下载安装包 · 切到别的页面也会继续";
+        } else {
+            EnterCriticalSection(&g_dlLock);
+            status = g_dlErr.empty() ? std::wstring(L"下载失败") : g_dlErr;
+            LeaveCriticalSection(&g_dlLock);
+            statusCol = C(Theme::Danger);
+        }
+    } else if (g_app.dlPhase == 0)      status = L"正在获取版本列表…";
     else if (g_app.dlPhase == 1) status = L"共 " + std::to_wstring(g_dlView.size()) + L" 个版本 · 滚轮翻页";
     else if (g_app.dlPhase == 2) status = L"正在下载 · 切到别的页面也会继续";
     else if (g_app.dlPhase == 3) status = L"下载完成，已加入版本列表";
@@ -2656,7 +3171,7 @@ static void DrawDlPage(Graphics& gr) {
         LeaveCriticalSection(&g_dlLock);
         statusCol = C(Theme::Danger);
     }
-    DrawStr(gr, status, DlSubRect(page, 24, 316, 420, 18), *F.log, statusCol);
+    DrawStr(gr, status, DlSubRect(page, 24, 316, 420, 18), *F.log, statusCol, StringAlignmentNear, true);
 
     // 按钮
     if (running) {
@@ -2664,6 +3179,18 @@ static void DrawDlPage(Graphics& gr) {
         FillRound(gr, cc, SR(9), C(Theme::Field));
         StrokeRound(gr, cc, SR(9), C(Theme::Border), SR(1));
         DrawStr(gr, L"取消", cc, *F.sub, C(Theme::Muted), StringAlignmentCenter);
+    } else if (alt) {
+        RectF go = DlGoRect(page);
+        std::wstring label = L"下一步";
+        bool canGo = false;
+        if (g_app.fgStage == 0)      { label = L"下一步";     canGo = !g_fgRows.empty(); }
+        else if (g_app.fgStage == 1) { label = L"获取中…";    canGo = false; }
+        else if (g_app.fgStage == 2) { label = L"下载安装包"; canGo = !g_fgRows.empty(); }
+        else                         { label = L"返回列表";   canGo = true; }
+        FillRound(gr, go, SR(9), C(canGo ? Theme::Accent : Theme::Field));
+        if (!canGo) StrokeRound(gr, go, SR(9), C(Theme::Border), SR(1));
+        DrawStr(gr, label, go, *F.sub,
+                C(canGo ? Theme::OnAccent : Theme::Muted), StringAlignmentCenter);
     } else {
         RectF go = DlGoRect(page);
         const bool canGo = (g_app.dlPhase == 1);
@@ -2674,9 +3201,94 @@ static void DrawDlPage(Graphics& gr) {
     }
 }
 
+// Forge 列表的行命中：一级（MC 版本）与二级（构建）共用同一块列表区域
+static int FgRowAt(const RectF& p, int x, int y) {
+    RectF l = DlListRect(p);
+    if (!InRect(l, x, y)) return -1;
+    const int i = (int)(((REAL)y - (l.Y + SR(4))) / SR(DL_ROW_H));
+    if (i < 0 || i >= DL_ROWS) return -1;
+    const int vi = g_app.fgScroll + i;
+    return (vi >= 0 && vi < (int)g_fgRows.size()) ? vi : -1;
+}
+
 static void HandleDlClick(int x, int y) {
     RectF page = DlPageRect();
     if (!InRect(page, x, y)) return;                                  // 页面外的事件不归这里管
+
+    // 来源切换：原版 / Forge / OptiFine（下载期间锁住）
+    if (!DlBusy()) {
+        for (int i = 0; i < 3; ++i) {
+            if (!InRect(DlSrcRect(page, i), x, y)) continue;
+            if (g_app.dlSrc != i) {
+                g_app.dlSrc   = i;
+                g_app.fgHover = -1;
+                if (i != 0) {
+                    OpenDownloadPage();                      // 一级要用同一份版本清单
+                    if (g_app.fgStage != 1 && g_app.fgStage != 5) {
+                        g_app.fgStage = 0;
+                        EnterCriticalSection(&g_dlLock);     // 换源就把上一来源的缓存丢掉
+                        g_fgList.clear();
+                        g_ofList.clear();
+                        g_fgErr.clear();
+                        LeaveCriticalSection(&g_dlLock);
+                    }
+                    RebuildFgRows();
+                } else {
+                    OpenDownloadPage();                      // 回到原版：确保清单在位、阶段正确
+                    RebuildDlView();
+                }
+            }
+            InvalidateRect(g_app.hwnd, nullptr, FALSE);
+            return;
+        }
+    }
+
+    // 取消：两种下载共用同一个按钮
+    if (DlBusy()) {
+        if (InRect(DlCancelRect(page), x, y)) {
+            g_dlCancel.store(true);
+            EnterCriticalSection(&g_dlLock);
+            g_dlErr = L"已取消下载";
+            LeaveCriticalSection(&g_dlLock);
+            if (g_app.dlSrc != 0) g_app.fgStage = 4;
+            else                  g_app.dlPhase = 4;
+            InvalidateRect(g_app.hwnd, nullptr, FALSE);
+        }
+        return;
+    }
+
+    if (g_app.dlSrc != 0) {
+        // 返回：二级 → 一级（拉取失败且没有列表时也回一级）
+        const bool inLevel2 = (g_app.fgStage == 2 || g_app.fgStage == 3 || g_app.fgStage == 4);
+        if (inLevel2 && InRect(DlBackRect(page), x, y)) {
+            g_app.fgStage  = g_fgList.empty() ? 0 : 2;
+            g_app.fgSel    = 0;
+            g_app.fgScroll = 0;
+            RebuildFgRows();
+            InvalidateRect(g_app.hwnd, nullptr, FALSE);
+            return;
+        }
+        if (InRect(DlGoRect(page), x, y)) {
+            if (g_app.fgStage == 0)      StartFgList();
+            else if (g_app.fgStage == 2) StartFgDownload();
+            else if (g_app.fgStage == 3 || g_app.fgStage == 4) {
+                g_app.fgStage  = g_fgList.empty() ? 0 : 2;
+                g_app.fgSel    = 0;
+                g_app.fgScroll = 0;
+                RebuildFgRows();
+                InvalidateRect(g_app.hwnd, nullptr, FALSE);
+            }
+            return;
+        }
+        if (g_app.fgStage == 0 || g_app.fgStage == 2) {
+            const int row = FgRowAt(page, x, y);
+            if (row >= 0) {
+                g_app.fgSel = row;
+                InvalidateRect(g_app.hwnd, nullptr, FALSE);
+            }
+        }
+        return;
+    }
 
     if (InRect(DlGoRect(page), x, y)) {
         if (g_app.dlPhase == 1) StartDlDownload();
@@ -2684,15 +3296,6 @@ static void HandleDlClick(int x, int y) {
             g_app.dlPhase = 1;
             InvalidateRect(g_app.hwnd, nullptr, FALSE);
         }
-        return;
-    }
-    if (g_app.dlPhase == 2 && InRect(DlCancelRect(page), x, y)) {
-        g_dlCancel.store(true);
-        EnterCriticalSection(&g_dlLock);
-        g_dlErr = L"已取消下载";
-        LeaveCriticalSection(&g_dlLock);
-        g_app.dlPhase = 4;
-        InvalidateRect(g_app.hwnd, nullptr, FALSE);
         return;
     }
     if (g_app.dlPhase != 1) return;
@@ -2812,7 +3415,7 @@ static void AnimMsDialog(bool open) {
     if (g_app.hwnd) InvalidateRect(g_app.hwnd, nullptr, FALSE);
 }
 
-static const wchar_t* kAppVersion = L"0.3.1";   // 与 res/app.rc 的版本资源保持一致
+static const wchar_t* kAppVersion = L"0.3.2";   // 与 res/app.rc 的版本资源保持一致
 
 // 标题下方的三个标签：开始 / 下载 / 设置
 static const wchar_t* kTabName[3] = { L"开始", L"下载", L"设置" };
@@ -3394,9 +3997,46 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_app.dlSel    = 0;
                 g_app.dlScroll = 0;
                 RebuildDlView();
+                if (g_app.dlSrc != 0 && g_app.fgStage == 0) RebuildFgRows();   // 附加组件一级也在等这份清单
             } else {
                 g_app.dlPhase = 4;
             }
+        } else if (wParam == 4) {                // Forge 构建 / OptiFine 补丁列表就绪
+            if (g_srcReq.load() != g_app.dlSrc) {          // 拉到一半换了来源，这份结果作废
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            const bool of = (g_app.dlSrc == 2);
+            g_app.fgSel    = 0;
+            g_app.fgScroll = 0;
+            g_app.fgStage  = (of ? g_ofList.size() : g_fgList.size()) ? 2 : 4;
+            RebuildFgRows();
+            if (g_app.fgStage == 4) {
+                EnterCriticalSection(&g_dlLock);
+                const std::wstring why = g_fgErr;
+                LeaveCriticalSection(&g_dlLock);
+                PushLog((of ? L"OptiFine 列表获取失败：" : L"Forge 列表获取失败：") +
+                        (why.empty() ? std::wstring(L"未知原因") : why));
+            } else {
+                PushLog(L"Minecraft " + g_app.fgMc + L" · " +
+                        std::to_wstring(g_fgRows.size()) +
+                        (of ? L" 个 OptiFine 版本" : L" 个 Forge 构建"));
+            }
+        } else if (wParam == 5) {                // Forge / OptiFine 安装包下载完成
+            const bool of = (g_app.dlSrc == 2);
+            g_app.fgStage = 3;
+            EnterCriticalSection(&g_dlLock);
+            const std::wstring saved = g_fgLastPath;
+            LeaveCriticalSection(&g_dlLock);
+            PushLog((of ? L"OptiFine 已保存：" : L"Forge 安装包已保存：") + saved);
+        } else if (wParam == 6) {                // 附加组件下载失败 / 取消
+            const bool of = (g_app.dlSrc == 2);
+            g_app.fgStage = 4;
+            EnterCriticalSection(&g_dlLock);
+            const std::wstring why = g_dlErr;
+            LeaveCriticalSection(&g_dlLock);
+            PushLog((of ? L"OptiFine 下载未完成：" : L"Forge 下载未完成：") +
+                    (why.empty() ? std::wstring(L"未知原因") : why));
         } else if (wParam == 2) {                // 下载完成
             g_app.dlPhase = 3;
             if (g_app.gameDir.empty()) g_app.gameDir = AppDataMinecraftDir();
@@ -3496,14 +4136,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (g_app.page == 1) {                   // 下载页：列表行 hover + 手型光标
             RectF page = DlPageRect();
-            const int r = (g_app.dlPhase == 1) ? DlRowAt(page, x, y) : -1;
-            if (r != g_app.dlHover) {
-                g_app.dlHover = r;
-                InvalidateRect(hwnd, nullptr, FALSE);
+            const bool fg = (g_app.dlSrc != 0);
+            const int r = fg
+                ? ((g_app.fgStage == 0 || g_app.fgStage == 2) ? FgRowAt(page, x, y) : -1)
+                : ((g_app.dlPhase == 1) ? DlRowAt(page, x, y) : -1);
+            if (fg) {
+                if (r != g_app.fgHover) { g_app.fgHover = r; InvalidateRect(hwnd, nullptr, FALSE); }
+            } else {
+                if (r != g_app.dlHover) { g_app.dlHover = r; InvalidateRect(hwnd, nullptr, FALSE); }
             }
-            bool hand = (r >= 0) || InRect(DlGoRect(page), x, y) ||
-                        (g_app.dlPhase == 2 && InRect(DlCancelRect(page), x, y));
-            if (!hand && g_app.dlPhase == 1) {
+
+            bool hand = (r >= 0) ||
+                        (DlBusy() ? InRect(DlCancelRect(page), x, y)
+                                  : InRect(DlGoRect(page), x, y));
+            if (!DlBusy()) {
+                for (int i = 0; i < 3 && !hand; ++i)
+                    hand = InRect(DlSrcRect(page, i), x, y);
+            }
+            if (!hand && fg && (g_app.fgStage == 2 || g_app.fgStage == 3 || g_app.fgStage == 4))
+                hand = InRect(DlBackRect(page), x, y);
+            if (!hand && !fg && g_app.dlPhase == 1) {
                 for (int i = 0; i < 3 && !hand; ++i)
                     hand = InRect(DlFilterRect(page, i), x, y);
             }
@@ -3615,6 +4267,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_MOUSEWHEEL: {
         if (g_app.page == 1) {                   // 下载列表翻页
+            if (g_app.dlSrc != 0) {
+                if (g_app.fgStage == 0 || g_app.fgStage == 2) {
+                    const int maxScroll = std::max(0, (int)g_fgRows.size() - DL_ROWS);
+                    const int step = (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? -1 : 1;
+                    g_app.fgScroll = std::max(0, std::min(maxScroll, g_app.fgScroll + step));
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
             if (g_app.dlPhase == 1) {
                 const int maxScroll = std::max(0, (int)g_dlView.size() - DL_ROWS);
                 const int step = (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? -1 : 1;
@@ -3662,6 +4323,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_app.page == 1) {
             if (wParam == VK_ESCAPE) { SwitchPage(0); return 0; }
             if (wParam == VK_RETURN) {
+                if (g_app.dlSrc != 0) {
+                    if (g_app.fgStage == 0)      StartFgList();
+                    else if (g_app.fgStage == 2) StartFgDownload();
+                    else if (g_app.fgStage == 3 || g_app.fgStage == 4) {
+                        g_app.fgStage  = g_fgList.empty() ? 0 : 2;
+                        g_app.fgSel    = 0;
+                        g_app.fgScroll = 0;
+                        RebuildFgRows();
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    return 0;
+                }
                 if (g_app.dlPhase == 1) StartDlDownload();
                 else if (g_app.dlPhase == 3 || g_app.dlPhase == 4) {
                     g_app.dlPhase = 1;
@@ -3669,7 +4342,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
                 return 0;
             }
-            if (g_app.dlPhase == 1 && (wParam == VK_UP || wParam == VK_DOWN)) {
+            const bool updown = (wParam == VK_UP || wParam == VK_DOWN);
+            if (g_app.dlSrc != 0) {
+                if (updown && (g_app.fgStage == 0 || g_app.fgStage == 2)) {
+                    const int n = (int)g_fgRows.size();
+                    if (n > 0) {
+                        g_app.fgSel += (wParam == VK_UP ? -1 : 1);
+                        g_app.fgSel = std::max(0, std::min(n - 1, g_app.fgSel));
+                        if (g_app.fgSel < g_app.fgScroll) g_app.fgScroll = g_app.fgSel;
+                        if (g_app.fgSel >= g_app.fgScroll + DL_ROWS)
+                            g_app.fgScroll = g_app.fgSel - DL_ROWS + 1;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                }
+                return 0;
+            }
+            if (g_app.dlPhase == 1 && updown) {
                 const int n = (int)g_dlView.size();
                 if (n > 0) {
                     g_app.dlSel += (wParam == VK_UP ? -1 : 1);
